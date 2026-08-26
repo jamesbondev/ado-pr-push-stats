@@ -1072,6 +1072,7 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
                 # the wrong end of that experiences a materially worse service than the
                 # headline number describes.
                 "final_unreviewed": 0,
+                "settles": [],
             },
         )
         rollup["prs"] += 1
@@ -1079,6 +1080,10 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
         rollup["reviews"] += reviews
         rollup["push_counts"].append(len(record.push_times))
         rollup["final_unreviewed"] += 1 if final_unreviewed else 0
+        if record.closed_at:
+            rollup["settles"].append(
+                (record.closed_at - record.push_times[-1]).total_seconds() / 3600
+            )
         for author in record.push_authors:
             rollup["author_pushes"][author] += 1
             rollup["author_prs"].setdefault(author, set()).add(index)
@@ -1217,6 +1222,14 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
         }
         values["reviews_per_pr"] = round(values["reviews"] / values["prs"], 2)
         values["pct_final_unreviewed"] = round(100 * values["final_unreviewed"] / values["prs"], 1)
+        # Median hours from the LAST PUSH to close, not from creation. Pull request
+        # lifetime was the obvious explanatory column and it is the wrong one: a repo can
+        # sit at a 27-hour median lifetime and still merge five minutes after every final
+        # push, which is what actually decides whether a quiet window outlives the PR.
+        repo_settles = values.pop("settles")
+        values["median_settle_hours"] = (
+            round(percentile(repo_settles, 0.5) or 0, 1) if repo_settles else 0.0
+        )
 
     org_push_avg = sum(push_counts) / len(records) if records else 0.0
     eligible = [
@@ -1420,6 +1433,7 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
                     "repository": name,
                     "prs": values["prs"],
                     "median_lifetime_hours": values["median_lifetime_hours"],
+                    "median_settle_hours": values["median_settle_hours"],
                     "final_unreviewed": values["final_unreviewed"],
                     "pct_final_unreviewed": values["pct_final_unreviewed"],
                 }
@@ -1654,14 +1668,16 @@ def render(stats: dict[str, Any]) -> str:
         add(f"  Org-wide the modelled window leaves {overall}% of pull requests with an")
         add("  unreviewed final state. That is an average over repositories whose pull")
         add("  requests close at very different speeds, and it is not what any one team")
-        add("  experiences. Worst-affected first; short-lived pull requests lose most.")
+        add("  experiences. Worst-affected first. Read 'settle h' - the median hours from")
+        add("  the LAST PUSH to close - not 'life h': a repo can run a 27-hour median")
+        add("  lifetime and still merge minutes after every final push.")
         add("")
-        add(f"  {'repository':<32} {'PRs':>5} {'life h':>8} {'unrev':>7} {'% of PRs':>10}")
+        add(f"  {'repository':<28} {'PRs':>5} {'life h':>7} {'settle h':>9} {'unrev':>6} {'% PRs':>7}")
         for entry in coverage:
             add(
-                f"  {entry['repository'][:32]:<32} {entry['prs']:>5} "
-                f"{entry['median_lifetime_hours']:>8} {entry['final_unreviewed']:>7} "
-                f"{entry['pct_final_unreviewed']:>9}%"
+                f"  {entry['repository'][:28]:<28} {entry['prs']:>5} "
+                f"{entry['median_lifetime_hours']:>7} {entry['median_settle_hours']:>9} "
+                f"{entry['final_unreviewed']:>6} {entry['pct_final_unreviewed']:>6}%"
             )
         add("")
 
