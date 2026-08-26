@@ -537,8 +537,15 @@ def debounce_review_times(
     while events:
         moment, kind, index = heapq.heappop(events)
         if kind == 0:
+            # The ledger restarts the burst clock on
+            #   LastExecutedMessageCreatedAt >= LatestMessageCreatedAt
+            # and BOTH are message-creation timestamps, not execution times. Comparing the
+            # execution time instead resets the clock far too eagerly, because a review
+            # always executes later than the push that scheduled it — which under-reports
+            # the forced executions the staleness valve produces during a sustained burst.
             if latest_registered_at is None or (
-                last_executed_at is not None and last_executed_at >= latest_registered_at
+                last_executed_message_created is not None
+                and last_executed_message_created >= latest_registered_at
             ):
                 burst_started_at = moment
             latest_registered_at = moment
