@@ -768,6 +768,10 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
     prs_with_draft_events = 0
     # (review times, last trigger, repo) per PR — the input every policy is scored on.
     streams: list[tuple[list[datetime], datetime | None, str]] = []
+    # Volume by calendar month of PR creation. Only says anything over a window long
+    # enough to hold more than one, but that is exactly when seasonality is the question:
+    # a single month cannot distinguish a habit from the month it was measured in.
+    monthly: dict[str, dict[str, int]] = {}
 
     for record in records:
         status_totals[record.status] += 1
@@ -821,6 +825,12 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
             simulate_debounce(record.push_times, quiet, max_staleness)
         )
         streams.append((review_times, triggers[-1] if triggers else None, record.repository))
+
+        month = record.created_at.strftime("%Y-%m")
+        bucket = monthly.setdefault(month, {"prs": 0, "pushes": 0, "reviews": 0})
+        bucket["prs"] += 1
+        bucket["pushes"] += len(record.push_times)
+        bucket["reviews"] += reviews
 
         rollup = repo_rollup.setdefault(
             record.repository, {"prs": 0, "pushes": 0, "reviews": 0, "push_counts": []}
@@ -980,6 +990,14 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
         "hard_cap_what_if": hard_caps,
         "cooldown_policy": cooldowns,
         "consent_gate_policy": consent_gates,
+        "monthly_volume": {
+            month: {
+                **values,
+                "reviews_per_pr": round(values["reviews"] / values["prs"], 2),
+                "pushes_per_pr": round(values["pushes"] / values["prs"], 2),
+            }
+            for month, values in sorted(monthly.items())
+        },
         "pr_lifetime_hours": summarise(lifetimes_hours),
         "top_repositories_by_reviews": top_repos,
         "top_repositories_by_pushes_per_pr": push_offenders,
@@ -1129,6 +1147,23 @@ def render(stats: dict[str, Any]) -> str:
         stats["consent_gate_policy"],
         "limit / resume rate",
     )
+
+    months = stats["monthly_volume"]
+    if len(months) > 1:
+        add("-" * 78)
+        add("VOLUME BY MONTH OF PR CREATION")
+        add("-" * 78)
+        add("  Partial at both ends: the first month is clipped by the window start, and the")
+        add("  last by PRs still open at collection. Compare whole months only.")
+        add("")
+        add(f"  {'month':<10} {'PRs':>7} {'pushes':>8} {'reviews':>9} {'push/PR':>9} {'rev/PR':>8}")
+        for month, values in months.items():
+            add(
+                f"  {month:<10} {values['prs']:>7} {values['pushes']:>8} "
+                f"{values['reviews']:>9} {values['pushes_per_pr']:>9} "
+                f"{values['reviews_per_pr']:>8}"
+            )
+        add("")
 
     add("-" * 78)
     add("PR LIFETIME (hours, closed PRs)")
