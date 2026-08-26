@@ -37,6 +37,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import heapq
 import zlib
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -486,7 +487,10 @@ def list_pull_requests(
 
 
 def debounce_review_times(
-    triggers: Sequence[datetime], quiet: timedelta, max_staleness: timedelta
+    triggers: Sequence[datetime],
+    quiet: timedelta,
+    max_staleness: timedelta,
+    rereview_quiet: timedelta | None = None,
 ) -> list[datetime]:
     """Return the times at which Argus' push debounce would actually execute a review.
 
@@ -499,16 +503,23 @@ def debounce_review_times(
 
     Returns execution times rather than a bare count so the review-limit policies below
     can gate the same stream without re-deriving it.
+
+    `rereview_quiet` makes the wait asymmetric: the first review of a pull request waits
+    `quiet`, every one after it waits `rereview_quiet`. The two questions are not the same
+    — a first review competes only on latency, while a re-review competes with the change
+    the author is still making — and a single window has to be wrong for one of them. The
+    ledger already knows whether a review has run, so this is implementable as written.
     """
     if not triggers:
         return []
 
     executed: list[datetime] = []
-    events: list[tuple[datetime, int, int]] = []
-    for index, moment in enumerate(triggers):
-        events.append((moment, 0, index))  # registration
-        events.append((moment + quiet, 1, index))  # message fires
-    events.sort(key=lambda event: (event[0], event[1]))
+    # Fire times can no longer be precomputed: how long a push waits depends on whether a
+    # review has executed by the time it registers. A heap keeps the merged ordering.
+    events: list[tuple[datetime, int, int]] = [
+        (moment, 0, index) for index, moment in enumerate(triggers)
+    ]
+    heapq.heapify(events)
 
     latest_registered_at: datetime | None = None
     latest_index: int | None = None
@@ -516,7 +527,8 @@ def debounce_review_times(
     last_executed_at: datetime | None = None
     last_executed_message_created: datetime | None = None
 
-    for moment, kind, index in events:
+    while events:
+        moment, kind, index = heapq.heappop(events)
         if kind == 0:
             if latest_registered_at is None or (
                 last_executed_at is not None and last_executed_at >= latest_registered_at
@@ -524,6 +536,8 @@ def debounce_review_times(
                 burst_started_at = moment
             latest_registered_at = moment
             latest_index = index
+            wait = quiet if (rereview_quiet is None or not executed) else rereview_quiet
+            heapq.heappush(events, (moment + wait, 1, index))
             continue
 
         created = triggers[index]
@@ -716,10 +730,17 @@ def histogram(values: Iterable[int]) -> dict[str, int]:
 
 
 def format_duration(seconds: float) -> str:
+    """Render a bucket edge without rounding it into a different number.
+
+    150 seconds formatted as "2m" is not a rounding nicety: a reader takes the bucket to
+    be two minutes, concludes the 150-second threshold is a subset of it, and reasons
+    about the wrong population. Sub-minute precision is kept wherever it changes the value.
+    """
     if seconds < 60:
         return f"{seconds:.0f}s"
     if seconds < 3600:
-        return f"{seconds / 60:.0f}m"
+        minutes = seconds / 60
+        return f"{minutes:.0f}m" if abs(minutes - round(minutes)) < 0.05 else f"{minutes:.1f}m"
     if seconds < 86400:
         return f"{seconds / 3600:.0f}h"
     return f"{seconds / 86400:.0f}d"
@@ -907,12 +928,21 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
     quiet_seconds = config["quiet_seconds"] + config["jitter_seconds"] / 2
     quiet = timedelta(seconds=quiet_seconds)
     max_staleness = timedelta(minutes=config["max_staleness_minutes"])
+    rereview_quiet = (
+        timedelta(seconds=config["rereview_quiet_seconds"] + config["jitter_seconds"] / 2)
+        if config.get("rereview_quiet_seconds")
+        else None
+    )
 
     push_counts: list[int] = []
     reason_totals: Counter[str] = Counter()
     status_totals: Counter[str] = Counter()
     gaps: list[float] = []
     lifetimes_hours: list[float] = []
+    # Hours from the final push to the pull request closing. A quiet window longer than
+    # this leaves the merged state unreviewed, so it is the hard ceiling on any
+    # coalescing scheme — and no amount of gap data substitutes for it.
+    last_push_to_close_hours: list[float] = []
 
     started_draft = 0
     started_published = 0
@@ -946,6 +976,9 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
 
         if record.closed_at:
             lifetimes_hours.append((record.closed_at - record.created_at).total_seconds() / 3600)
+            settle = (record.closed_at - record.push_times[-1]).total_seconds() / 3600
+            if settle >= 0:
+                last_push_to_close_hours.append(settle)
 
         history = record.draft
         if history.toggles:
@@ -980,7 +1013,7 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
             triggers = list(record.push_times)
 
         eligible_triggers.append(len(triggers))
-        review_times = debounce_review_times(triggers, quiet, max_staleness)
+        review_times = debounce_review_times(triggers, quiet, max_staleness, rereview_quiet)
         reviews = len(review_times)
         simulated_reviews.append(reviews)
         simulated_reviews_if_drafts_reviewed.append(
@@ -1280,6 +1313,23 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
             for month, values in sorted(monthly.items())
         },
         "pr_lifetime_hours": summarise(lifetimes_hours),
+        "last_push_to_close_hours": {
+            **summarise(last_push_to_close_hours),
+            "pct_closed_within": {
+                label: round(
+                    100
+                    * sum(1 for v in last_push_to_close_hours if v <= hours)
+                    / len(last_push_to_close_hours),
+                    1,
+                )
+                if last_push_to_close_hours
+                else 0.0
+                for label, hours in (
+                    ("10m", 1 / 6), ("20m", 1 / 3), ("30m", 0.5),
+                    ("1h", 1.0), ("2h", 2.0), ("4h", 4.0),
+                )
+            },
+        },
         "top_repositories_by_reviews": top_repos,
         "top_repositories_by_pushes_per_pr": push_offenders,
         "author_concentration": [
@@ -1474,6 +1524,19 @@ def render(stats: dict[str, Any]) -> str:
     render_summary(lines, stats["pr_lifetime_hours"])
     add("")
 
+    settle = stats["last_push_to_close_hours"]
+    add("-" * 78)
+    add("LAST PUSH -> CLOSE (hours) — the ceiling on any quiet window")
+    add("-" * 78)
+    add("  A quiet window longer than this leaves the merged state unreviewed. The")
+    add("  percentages are the share of PRs that closed within each window, i.e. the")
+    add("  share whose final state a window of that length would MISS.")
+    render_summary(lines, settle)
+    add("")
+    for label, pct in settle["pct_closed_within"].items():
+        add(f"    closed within {label:<4} of the last push: {pct:>5}%")
+    add("")
+
     add("-" * 78)
     add("TOP REPOSITORIES BY SIMULATED REVIEWS")
     add("-" * 78)
@@ -1629,6 +1692,13 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--exclude-repo", action="append", default=[], help="Repository name to skip. Repeatable.")
     parser.add_argument("--concurrency", type=int, default=8, help="Parallel PR fetches (default 8).")
     parser.add_argument("--quiet-seconds", type=int, default=DEFAULT_QUIET_SECONDS)
+    parser.add_argument(
+        "--rereview-quiet-seconds",
+        type=int,
+        help="Quiet period for the SECOND and later reviews of a pull request, making the "
+        "wait asymmetric. The first review competes only on latency; a re-review competes "
+        "with the change the author is still making. Omit for one window throughout.",
+    )
     parser.add_argument("--jitter-seconds", type=int, default=DEFAULT_JITTER_SECONDS)
     parser.add_argument("--max-staleness-minutes", type=int, default=DEFAULT_MAX_STALENESS_MINUTES)
     parser.add_argument("--top-repos", type=int, default=10)
@@ -1695,6 +1765,7 @@ def main(argv: Sequence[str]) -> int:
         config = {
             **meta,
             "quiet_seconds": args.quiet_seconds,
+            "rereview_quiet_seconds": args.rereview_quiet_seconds,
             "jitter_seconds": args.jitter_seconds,
             "max_staleness_minutes": args.max_staleness_minutes,
             "top_repos": args.top_repos,
@@ -1795,6 +1866,7 @@ def main(argv: Sequence[str]) -> int:
         "projects": projects,
         "statuses": sorted(statuses),
         "quiet_seconds": args.quiet_seconds,
+        "rereview_quiet_seconds": args.rereview_quiet_seconds,
         "jitter_seconds": args.jitter_seconds,
         "max_staleness_minutes": args.max_staleness_minutes,
         "top_repos": args.top_repos,
