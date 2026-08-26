@@ -703,17 +703,35 @@ def histogram(values: Iterable[int]) -> dict[str, int]:
     return buckets
 
 
+def format_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.0f}m"
+    if seconds < 86400:
+        return f"{seconds / 3600:.0f}h"
+    return f"{seconds / 86400:.0f}d"
+
+
 def gap_buckets(gaps_seconds: Iterable[float], quiet_seconds: int) -> dict[str, int]:
-    """Bucket inter-push gaps around the debounce, since that is the decision boundary."""
-    edges = [
-        (f"<= {quiet_seconds}s (debounce absorbs)", quiet_seconds),
-        (f"{quiet_seconds}s - 5m", 300),
-        ("5m - 20m", 1200),
-        ("20m - 1h", 3600),
-        ("1h - 4h", 14400),
-        ("4h - 24h", 86400),
-        ("> 24h", float("inf")),
+    """Bucket inter-push gaps around the debounce, since that is the decision boundary.
+
+    The upper edges are fixed, but the first is the quiet period — so a quiet period above
+    an edge swallows that bucket whole. Those are dropped rather than printed as an empty
+    row with a label that misdescribes what it holds (a quiet period of 600s left a
+    "600s - 5m" row reading zero, and a "5m - 20m" row actually holding 10m-20m).
+    """
+    ceilings = [300.0, 1200.0, 3600.0, 14400.0, 86400.0]
+    edges: list[tuple[str, float]] = [
+        (f"<= {format_duration(quiet_seconds)} (debounce absorbs)", float(quiet_seconds))
     ]
+    lower = float(quiet_seconds)
+    for ceiling in ceilings:
+        if ceiling <= quiet_seconds:
+            continue  # already inside the absorbed band
+        edges.append((f"{format_duration(lower)} - {format_duration(ceiling)}", ceiling))
+        lower = ceiling
+    edges.append((f"> {format_duration(lower)}", float("inf")))
     buckets = {label: 0 for label, _ in edges}
     for gap in gaps_seconds:
         for label, ceiling in edges:
