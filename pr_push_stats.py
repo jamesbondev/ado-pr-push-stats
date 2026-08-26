@@ -491,6 +491,7 @@ def debounce_review_times(
     quiet: timedelta,
     max_staleness: timedelta,
     rereview_quiet: timedelta | None = None,
+    closed_at: datetime | None = None,
 ) -> list[datetime]:
     """Return the times at which Argus' push debounce would actually execute a review.
 
@@ -509,6 +510,12 @@ def debounce_review_times(
     — a first review competes only on latency, while a re-review competes with the change
     the author is still making — and a single window has to be wrong for one of them. The
     ledger already knows whether a review has run, so this is implementable as written.
+
+    `closed_at` drops reviews that would fire after the pull request closed. Without it the
+    simulation reports a review as delivered whenever it was scheduled, which silently
+    assumes every pull request stays open long enough to receive it — and the longer the
+    quiet period, the less true that becomes. Those are not savings; they are the final
+    state going unreviewed.
     """
     if not triggers:
         return []
@@ -543,7 +550,8 @@ def debounce_review_times(
         created = triggers[index]
         if latest_index != index:
             if burst_started_at is not None and (moment - burst_started_at) > max_staleness:
-                executed.append(moment)
+                if closed_at is None or moment <= closed_at:
+                    executed.append(moment)
                 last_executed_at = moment
                 last_executed_message_created = created
             continue
@@ -551,7 +559,8 @@ def debounce_review_times(
         if last_executed_message_created is not None and last_executed_message_created > created:
             continue  # a later message already ran and covered this push
 
-        executed.append(moment)
+        if closed_at is None or moment <= closed_at:
+            executed.append(moment)
         last_executed_at = moment
         last_executed_message_created = created
 
@@ -943,6 +952,10 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
     # this leaves the merged state unreviewed, so it is the hard ceiling on any
     # coalescing scheme — and no amount of gap data substitutes for it.
     last_push_to_close_hours: list[float] = []
+    # Split by push count: for a single-push pull request the last push is also the first,
+    # so a window that outlives it costs the ONLY review, not merely the latest one.
+    settle_single: list[float] = []
+    settle_multi: list[float] = []
 
     started_draft = 0
     started_published = 0
@@ -958,6 +971,8 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
     repo_rollup: dict[str, dict[str, Any]] = {}
     draft_property_keys: Counter[str] = Counter()
     prs_with_draft_events = 0
+    reviews_lost_to_close = 0
+    prs_final_state_unreviewed = 0
     # (review times, last trigger, repo) per PR — the input every policy is scored on.
     streams: list[tuple[list[datetime], datetime | None, str]] = []
     # Volume by calendar month of PR creation. Only says anything over a window long
@@ -979,6 +994,8 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
             settle = (record.closed_at - record.push_times[-1]).total_seconds() / 3600
             if settle >= 0:
                 last_push_to_close_hours.append(settle)
+                target = settle_single if len(record.push_times) == 1 else settle_multi
+                target.append(settle)
 
         history = record.draft
         if history.toggles:
@@ -1013,7 +1030,17 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
             triggers = list(record.push_times)
 
         eligible_triggers.append(len(triggers))
-        review_times = debounce_review_times(triggers, quiet, max_staleness, rereview_quiet)
+        review_times = debounce_review_times(
+            triggers, quiet, max_staleness, rereview_quiet, record.closed_at
+        )
+        # What the window cost in coverage, as distinct from what it saved. A review that
+        # was scheduled but fired after the pull request closed is not a saving.
+        scheduled = len(
+            debounce_review_times(triggers, quiet, max_staleness, rereview_quiet)
+        )
+        reviews_lost_to_close += scheduled - len(review_times)
+        if triggers and not any(t >= triggers[-1] for t in review_times):
+            prs_final_state_unreviewed += 1
         reviews = len(review_times)
         simulated_reviews.append(reviews)
         simulated_reviews_if_drafts_reviewed.append(
@@ -1300,6 +1327,13 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
             "reviews_per_pr": summarise([float(v) for v in simulated_reviews]),
             "reviews_per_pr_histogram": histogram(simulated_reviews),
             "reviews_if_drafts_were_reviewed": sum(simulated_reviews_if_drafts_reviewed),
+            # Coverage cost, not saving: scheduled reviews that fired after the pull
+            # request had already closed.
+            "reviews_lost_to_close": reviews_lost_to_close,
+            "prs_final_state_unreviewed": prs_final_state_unreviewed,
+            "pct_final_state_unreviewed": (
+                round(100 * prs_final_state_unreviewed / len(records), 1) if records else 0.0
+            ),
         },
         "hard_cap_what_if": hard_caps,
         "cooldown_policy": cooldowns,
@@ -1313,6 +1347,30 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
             for month, values in sorted(monthly.items())
         },
         "pr_lifetime_hours": summarise(lifetimes_hours),
+        "last_push_to_close_single_push": {
+            **summarise(settle_single),
+            "pct_closed_within": {
+                label: round(100 * sum(1 for v in settle_single if v <= hours) / len(settle_single), 1)
+                if settle_single
+                else 0.0
+                for label, hours in (
+                    ("10m", 1 / 6), ("20m", 1 / 3), ("30m", 0.5),
+                    ("1h", 1.0), ("2h", 2.0), ("4h", 4.0),
+                )
+            },
+        },
+        "last_push_to_close_multi_push": {
+            **summarise(settle_multi),
+            "pct_closed_within": {
+                label: round(100 * sum(1 for v in settle_multi if v <= hours) / len(settle_multi), 1)
+                if settle_multi
+                else 0.0
+                for label, hours in (
+                    ("10m", 1 / 6), ("20m", 1 / 3), ("30m", 0.5),
+                    ("1h", 1.0), ("2h", 2.0), ("4h", 4.0),
+                )
+            },
+        },
         "last_push_to_close_hours": {
             **summarise(last_push_to_close_hours),
             "pct_closed_within": {
@@ -1533,8 +1591,24 @@ def render(stats: dict[str, Any]) -> str:
     add("  share whose final state a window of that length would MISS.")
     render_summary(lines, settle)
     add("")
-    for label, pct in settle["pct_closed_within"].items():
-        add(f"    closed within {label:<4} of the last push: {pct:>5}%")
+    single = stats["last_push_to_close_single_push"]
+    multi = stats["last_push_to_close_multi_push"]
+    add(f"  {'window':<8}{'all':>8}{'1-push PRs':>13}{'2+-push PRs':>13}")
+    for label in settle["pct_closed_within"]:
+        add(
+            f"  {label:<8}{settle['pct_closed_within'][label]:>7}%"
+            f"{single['pct_closed_within'][label]:>12}%"
+            f"{multi['pct_closed_within'][label]:>12}%"
+        )
+    add("")
+    add("  The 1-push column is the one that matters: for those PRs the last push is also")
+    add("  the first, so a window outliving it costs the ONLY review, not the latest one.")
+    add("")
+
+    sim_cov = stats["debounce_simulation"]
+    add(f"  at the modelled window: {sim_cov['reviews_lost_to_close']} reviews fired after close; "
+        f"{sim_cov['prs_final_state_unreviewed']} PRs "
+        f"({sim_cov['pct_final_state_unreviewed']}%) end with an unreviewed final state")
     add("")
 
     add("-" * 78)
