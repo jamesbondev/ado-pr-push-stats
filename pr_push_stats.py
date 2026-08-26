@@ -37,6 +37,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -52,8 +53,17 @@ DEFAULT_QUIET_SECONDS = 150
 DEFAULT_JITTER_SECONDS = 15
 DEFAULT_MAX_STALENESS_MINUTES = 20
 
-# Caps modelled in the what-if table. Purely a reporting choice.
+# Review allowances and cooldowns modelled in the policy tables. Reporting choices only.
 CAP_CANDIDATES = (3, 5, 8, 10, 15, 20)
+POLICY_LIMITS = (2, 3, 5)
+COOLDOWN_HOURS = (1, 2, 4, 8)
+RESUME_RATES = (0.0, 0.25, 0.5, 0.75, 1.0)
+
+# A repository needs at least this many pull requests before it appears in the push
+# profile. Without a floor the table is topped by repos with one very active PR.
+MIN_PRS_FOR_PROFILE = 5
+
+CACHE_FORMAT_VERSION = 1
 
 FRACTIONAL_SECONDS = re.compile(r"\.(\d{1,9})")
 
@@ -311,6 +321,85 @@ def fetch_pr_record(
 
 
 # --------------------------------------------------------------------------- #
+# Raw cache
+#
+# The fetch is thousands of requests and minutes of wall clock; every policy question
+# afterwards is arithmetic over the same timelines. So the timelines are written once and
+# re-read for every subsequent scoring run.
+#
+# This file is NOT the shareable artefact. It holds per-pull-request push timestamps,
+# which the aggregate report deliberately does not. Keep it local; share the --json.
+# --------------------------------------------------------------------------- #
+
+
+def save_cache(path: str, records: Sequence[PrRecord], meta: dict[str, Any]) -> None:
+    payload = {
+        "format_version": CACHE_FORMAT_VERSION,
+        "meta": meta,
+        "pull_requests": [
+            {
+                "repository": record.repository,
+                "status": record.status,
+                "created_at": record.created_at.isoformat(),
+                "closed_at": record.closed_at.isoformat() if record.closed_at else None,
+                "push_times": [moment.isoformat() for moment in record.push_times],
+                "reasons": record.reasons,
+                "draft": {
+                    "started_draft": record.draft.started_draft,
+                    "published_at": (
+                        record.draft.published_at.isoformat()
+                        if record.draft.published_at
+                        else None
+                    ),
+                    "toggles": record.draft.toggles,
+                    "property_keys": record.draft.property_keys,
+                },
+            }
+            for record in records
+        ],
+    }
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, separators=(",", ":"))
+
+
+def load_cache(path: str) -> tuple[list[PrRecord], dict[str, Any]]:
+    with open(path, encoding="utf-8") as handle:
+        payload = json.load(handle)
+
+    version = payload.get("format_version")
+    if version != CACHE_FORMAT_VERSION:
+        raise AdoError(
+            f"{path} is cache format v{version}, this build reads v{CACHE_FORMAT_VERSION}. "
+            f"Re-run with --refresh to rebuild it."
+        )
+
+    records: list[PrRecord] = []
+    for item in payload["pull_requests"]:
+        draft = item["draft"]
+        push_times = [parse_time(value) for value in item["push_times"]]
+        push_times = [moment for moment in push_times if moment is not None]
+        if not push_times:
+            continue
+        records.append(
+            PrRecord(
+                repository=item["repository"],
+                status=item["status"],
+                created_at=parse_time(item["created_at"]) or push_times[0],
+                closed_at=parse_time(item["closed_at"]),
+                push_times=push_times,
+                reasons=item["reasons"],
+                draft=DraftHistory(
+                    started_draft=draft["started_draft"],
+                    published_at=parse_time(draft["published_at"]),
+                    toggles=draft["toggles"],
+                    property_keys=draft["property_keys"],
+                ),
+            )
+        )
+    return records, payload.get("meta", {})
+
+
+# --------------------------------------------------------------------------- #
 # Collection
 # --------------------------------------------------------------------------- #
 
@@ -384,10 +473,10 @@ def list_pull_requests(
 # --------------------------------------------------------------------------- #
 
 
-def simulate_debounce(
+def debounce_review_times(
     triggers: Sequence[datetime], quiet: timedelta, max_staleness: timedelta
-) -> int:
-    """Count how many reviews Argus' push debounce would actually execute.
+) -> list[datetime]:
+    """Return the times at which Argus' push debounce would actually execute a review.
 
     Mirrors ReviewDebounceScheduler + ReviewDebounceCoordinator: every push registers
     itself as the pull request's latest and schedules its own message for `quiet` later;
@@ -395,10 +484,14 @@ def simulate_debounce(
     has been running longer than `max_staleness`, in which case it is forced through
     against head. The burst clock restarts whenever a review executes with nothing newer
     already registered behind it.
+
+    Returns execution times rather than a bare count so the review-limit policies below
+    can gate the same stream without re-deriving it.
     """
     if not triggers:
-        return 0
+        return []
 
+    executed: list[datetime] = []
     events: list[tuple[datetime, int, int]] = []
     for index, moment in enumerate(triggers):
         events.append((moment, 0, index))  # registration
@@ -410,7 +503,6 @@ def simulate_debounce(
     burst_started_at: datetime | None = None
     last_executed_at: datetime | None = None
     last_executed_message_created: datetime | None = None
-    reviews = 0
 
     for moment, kind, index in events:
         if kind == 0:
@@ -425,7 +517,7 @@ def simulate_debounce(
         created = triggers[index]
         if latest_index != index:
             if burst_started_at is not None and (moment - burst_started_at) > max_staleness:
-                reviews += 1
+                executed.append(moment)
                 last_executed_at = moment
                 last_executed_message_created = created
             continue
@@ -433,11 +525,125 @@ def simulate_debounce(
         if last_executed_message_created is not None and last_executed_message_created > created:
             continue  # a later message already ran and covered this push
 
-        reviews += 1
+        executed.append(moment)
         last_executed_at = moment
         last_executed_message_created = created
 
-    return reviews
+    return executed
+
+
+def simulate_debounce(
+    triggers: Sequence[datetime], quiet: timedelta, max_staleness: timedelta
+) -> int:
+    return len(debounce_review_times(triggers, quiet, max_staleness))
+
+
+# --------------------------------------------------------------------------- #
+# Review-limit policies
+#
+# Three ways to stop a pull request consuming unbounded reviews, modelled as a gate on
+# the stream of reviews the debounce already decided to run. The gate never re-opens the
+# debounce's own decisions, so a policy can only ever remove reviews, never add them.
+#
+# The approximation: a push arriving during a cooldown is dropped here, whereas in
+# production it would never have entered the ledger at all. The two differ only for a
+# push that straddles a cooldown boundary and would have been coalesced across it —
+# rare, and it costs at most one review per boundary.
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class PolicyOutcome:
+    """What one policy did to one pull request's review stream."""
+
+    reviews: list[datetime] = field(default_factory=list)
+    gate_trips: int = 0  # each trip is one "not ready for review" comment
+    resume_requests: int = 0  # option 1 only: times the author had to ask
+
+    def final_state_reviewed(self, last_trigger: datetime | None) -> bool:
+        """Did any surviving review cover the pull request's final push?
+
+        The safety question. A policy that suppresses the last review leaves the code
+        that actually merges unreviewed, which is a different kind of cost from spend.
+        """
+        if last_trigger is None:
+            return True
+        return any(moment >= last_trigger for moment in self.reviews)
+
+
+def apply_hard_cap(reviews: Sequence[datetime], limit: int) -> PolicyOutcome:
+    """Baseline for comparison: after `limit` reviews the pull request is never reviewed again."""
+    outcome = PolicyOutcome(reviews=list(reviews[:limit]))
+    if len(reviews) > limit:
+        outcome.gate_trips = 1
+    return outcome
+
+
+def apply_cooldown(
+    reviews: Sequence[datetime], limit: int, cooldown: timedelta
+) -> PolicyOutcome:
+    """Option 2: after `limit` reviews, comment and ignore pushes for `cooldown`, then reset.
+
+    The allowance is a sliding window anchored on the review that tripped it, not a fixed
+    calendar bucket: three reviews at 12:03, 12:50 and 13:01 with a two-hour cooldown go
+    quiet until 15:01, and a push at 15:05 starts a fresh allowance of three.
+    """
+    outcome = PolicyOutcome()
+    count = 0
+    cooldown_until: datetime | None = None
+
+    for moment in reviews:
+        if cooldown_until is not None:
+            if moment < cooldown_until:
+                continue  # inside the quiet window: push ignored, no review
+            cooldown_until = None
+            count = 0  # window expired, allowance resets
+
+        outcome.reviews.append(moment)
+        count += 1
+        if count >= limit:
+            outcome.gate_trips += 1
+            cooldown_until = moment + cooldown
+            count = 0
+
+    return outcome
+
+
+def apply_consent_gate(
+    reviews: Sequence[datetime], limit: int, resume_rate: float, key: str
+) -> PolicyOutcome:
+    """Option 1: after `limit` reviews, stop until the author explicitly asks to continue.
+
+    Whether an author asks cannot be read off historical data — nobody was ever asked. So
+    it is a parameter, and the two ends of it bracket the policy: at `resume_rate` 0 this
+    is exactly a hard cap, and at 1.0 it saves nothing but the round trip. The draw is a
+    stable hash of the pull request and the trip number, so a given rate always produces
+    the same answer for the same input.
+    """
+    outcome = PolicyOutcome()
+    count = 0
+    blocked = False
+    will_resume = False
+
+    for moment in reviews:
+        if blocked:
+            if not will_resume:
+                continue
+            blocked = False
+            will_resume = False
+            count = 0
+
+        outcome.reviews.append(moment)
+        count += 1
+        if count >= limit:
+            outcome.gate_trips += 1
+            blocked = True
+            draw = zlib.crc32(f"{key}:{outcome.gate_trips}".encode()) % 10_000 / 10_000
+            will_resume = draw < resume_rate
+            if will_resume:
+                outcome.resume_requests += 1
+
+    return outcome
 
 
 # --------------------------------------------------------------------------- #
@@ -530,9 +736,11 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
     eligible_triggers: list[int] = []
     simulated_reviews: list[int] = []
     simulated_reviews_if_drafts_reviewed: list[int] = []
-    repo_rollup: dict[str, dict[str, int]] = {}
+    repo_rollup: dict[str, dict[str, Any]] = {}
     draft_property_keys: Counter[str] = Counter()
     prs_with_draft_events = 0
+    # (review times, last trigger, repo) per PR — the input every policy is scored on.
+    streams: list[tuple[list[datetime], datetime | None, str]] = []
 
     for record in records:
         status_totals[record.status] += 1
@@ -579,33 +787,103 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
             triggers = list(record.push_times)
 
         eligible_triggers.append(len(triggers))
-        reviews = simulate_debounce(triggers, quiet, max_staleness)
+        review_times = debounce_review_times(triggers, quiet, max_staleness)
+        reviews = len(review_times)
         simulated_reviews.append(reviews)
         simulated_reviews_if_drafts_reviewed.append(
             simulate_debounce(record.push_times, quiet, max_staleness)
         )
+        streams.append((review_times, triggers[-1] if triggers else None, record.repository))
 
-        rollup = repo_rollup.setdefault(record.repository, {"prs": 0, "pushes": 0, "reviews": 0})
+        rollup = repo_rollup.setdefault(
+            record.repository, {"prs": 0, "pushes": 0, "reviews": 0, "push_counts": []}
+        )
         rollup["prs"] += 1
         rollup["pushes"] += len(record.push_times)
         rollup["reviews"] += reviews
+        rollup["push_counts"].append(len(record.push_times))
 
     total_triggers = sum(eligible_triggers)
     total_reviews = sum(simulated_reviews)
 
-    caps = {}
-    for cap in CAP_CANDIDATES:
-        over = [count for count in simulated_reviews if count > cap]
-        caps[str(cap)] = {
-            "prs_over_cap": len(over),
-            "pct_prs_over_cap": round(100 * len(over) / len(records), 1) if records else 0.0,
-            "reviews_saved": sum(count - cap for count in over),
+    def score(outcomes: Sequence[PolicyOutcome]) -> dict[str, Any]:
+        """Reduce one policy's per-PR outcomes to the numbers worth comparing."""
+        kept = sum(len(outcome.reviews) for outcome in outcomes)
+        trips = sum(outcome.gate_trips for outcome in outcomes)
+        gated = sum(1 for outcome in outcomes if outcome.gate_trips)
+        repeat_gated = sum(1 for outcome in outcomes if outcome.gate_trips > 1)
+        unreviewed_final = sum(
+            1
+            for outcome, (_, last_trigger, _) in zip(outcomes, streams)
+            if not outcome.final_state_reviewed(last_trigger)
+        )
+        return {
+            "reviews": kept,
+            "reviews_saved": total_reviews - kept,
             "pct_reviews_saved": (
-                round(100 * sum(count - cap for count in over) / total_reviews, 1)
-                if total_reviews
-                else 0.0
+                round(100 * (total_reviews - kept) / total_reviews, 1) if total_reviews else 0.0
             ),
+            # Each trip posts a comment. This is the policy's noise cost, and it is the
+            # number to watch: a policy that saves reviews by interrupting everyone
+            # constantly has moved the cost rather than removed it.
+            "gate_trips": trips,
+            "prs_gated": gated,
+            "pct_prs_gated": round(100 * gated / len(records), 1) if records else 0.0,
+            "prs_gated_more_than_once": repeat_gated,
+            # The safety cost: the pull request's final state never got reviewed.
+            "prs_final_push_unreviewed": unreviewed_final,
+            "pct_final_push_unreviewed": (
+                round(100 * unreviewed_final / len(records), 1) if records else 0.0
+            ),
+            "resume_requests": sum(outcome.resume_requests for outcome in outcomes),
         }
+
+    hard_caps = {
+        str(limit): score([apply_hard_cap(times, limit) for times, _, _ in streams])
+        for limit in CAP_CANDIDATES
+    }
+
+    cooldowns = {
+        f"limit={limit},cooldown={hours}h": score(
+            [
+                apply_cooldown(times, limit, timedelta(hours=hours))
+                for times, _, _ in streams
+            ]
+        )
+        for limit in POLICY_LIMITS
+        for hours in COOLDOWN_HOURS
+    }
+
+    consent_gates = {
+        f"limit={limit},resume={rate:.2f}": score(
+            [
+                apply_consent_gate(times, limit, rate, f"{repo}:{index}")
+                for index, (times, _, repo) in enumerate(streams)
+            ]
+        )
+        for limit in POLICY_LIMITS
+        for rate in RESUME_RATES
+    }
+
+    for values in repo_rollup.values():
+        counts = [float(count) for count in values.pop("push_counts")]
+        values["pushes_per_pr"] = {
+            "min": int(min(counts)),
+            "median": round(percentile(counts, 0.5) or 0, 1),
+            "mean": round(sum(counts) / len(counts), 2),
+            "p90": round(percentile(counts, 0.9) or 0, 1),
+            "max": int(max(counts)),
+        }
+        values["reviews_per_pr"] = round(values["reviews"] / values["prs"], 2)
+
+    eligible = [
+        {"repository": name, **values}
+        for name, values in repo_rollup.items()
+        if values["prs"] >= MIN_PRS_FOR_PROFILE
+    ]
+    push_offenders = sorted(
+        eligible, key=lambda item: item["pushes_per_pr"]["mean"], reverse=True
+    )[: config["top_repos"]]
 
     top_repos = sorted(
         (
@@ -616,8 +894,10 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
         reverse=True,
     )[: config["top_repos"]]
     if config["anonymise_repos"]:
-        for index, entry in enumerate(top_repos, start=1):
-            entry["repository"] = f"repo-{index}"
+        aliases: dict[str, str] = {}
+        for entry in [*top_repos, *push_offenders]:
+            alias = aliases.setdefault(entry["repository"], f"repo-{len(aliases) + 1}")
+            entry["repository"] = alias
 
     return {
         "config": config,
@@ -663,9 +943,12 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
             "reviews_per_pr_histogram": histogram(simulated_reviews),
             "reviews_if_drafts_were_reviewed": sum(simulated_reviews_if_drafts_reviewed),
         },
-        "hard_cap_what_if": caps,
+        "hard_cap_what_if": hard_caps,
+        "cooldown_policy": cooldowns,
+        "consent_gate_policy": consent_gates,
         "pr_lifetime_hours": summarise(lifetimes_hours),
         "top_repositories_by_reviews": top_repos,
+        "top_repositories_by_pushes_per_pr": push_offenders,
         "data_quality": {
             "draft_property_keys_seen": dict(draft_property_keys.most_common()),
             "prs_with_undetermined_draft_state": draft_undetermined,
@@ -774,16 +1057,43 @@ def render(stats: dict[str, Any]) -> str:
     )
     add("")
 
-    add("-" * 78)
-    add("HARD CAP WHAT-IF (on top of the debounce)")
-    add("-" * 78)
-    add(f"  {'cap':>5}  {'PRs over':>9}  {'% PRs':>7}  {'reviews saved':>14}  {'% reviews':>10}")
-    for cap, values in stats["hard_cap_what_if"].items():
+    def policy_table(title: str, note: str, rows: dict[str, Any], first_column: str) -> None:
+        add("-" * 78)
+        add(title)
+        add("-" * 78)
+        add(f"  {note}")
+        add("")
         add(
-            f"  {cap:>5}  {values['prs_over_cap']:>9}  {values['pct_prs_over_cap']:>6}%  "
-            f"{values['reviews_saved']:>14}  {values['pct_reviews_saved']:>9}%"
+            f"  {first_column:<22} {'reviews':>8} {'saved':>7} {'comments':>9} "
+            f"{'PRs hit':>8} {'>1 hit':>7} {'unreviewed final':>17}"
         )
-    add("")
+        for label, values in rows.items():
+            add(
+                f"  {label:<22} {values['reviews']:>8} {values['pct_reviews_saved']:>6}% "
+                f"{values['gate_trips']:>9} {values['pct_prs_gated']:>7}% "
+                f"{values['prs_gated_more_than_once']:>7} "
+                f"{values['prs_final_push_unreviewed']:>7} ({values['pct_final_push_unreviewed']:>4}%)"
+            )
+        add("")
+
+    policy_table(
+        "POLICY A — HARD CAP (never review again once the limit is hit)",
+        "Included as the floor: it is what options 1 and 2 collapse to if nobody ever resumes.",
+        stats["hard_cap_what_if"],
+        "cap",
+    )
+    policy_table(
+        "POLICY B — COOLDOWN WINDOW (stop, comment, ignore pushes for N hours, reset)",
+        "'comments' is how many 'not ready for review' notes would be posted in the window.",
+        stats["cooldown_policy"],
+        "limit / cooldown",
+    )
+    policy_table(
+        "POLICY C — CONSENT GATE (stop until the author explicitly asks to continue)",
+        "resume=0.00 is identical to the hard cap; resume=1.00 costs a round trip and saves nothing.",
+        stats["consent_gate_policy"],
+        "limit / resume rate",
+    )
 
     add("-" * 78)
     add("PR LIFETIME (hours, closed PRs)")
@@ -799,6 +1109,22 @@ def render(stats: dict[str, Any]) -> str:
         add(
             f"  {entry['repository'][:40]:<40} {entry['prs']:>5} "
             f"{entry['pushes']:>8} {entry['reviews']:>9}"
+        )
+    add("")
+
+    add("-" * 78)
+    add(f"PUSH-HEAVIEST REPOSITORIES (mean pushes per PR, min {MIN_PRS_FOR_PROFILE} PRs)")
+    add("-" * 78)
+    add(
+        f"  {'repository':<34} {'PRs':>5} {'min':>4} {'med':>5} {'mean':>6} "
+        f"{'p90':>5} {'max':>5} {'rev/PR':>7}"
+    )
+    for entry in stats["top_repositories_by_pushes_per_pr"]:
+        profile = entry["pushes_per_pr"]
+        add(
+            f"  {entry['repository'][:34]:<34} {entry['prs']:>5} {profile['min']:>4} "
+            f"{profile['median']:>5} {profile['mean']:>6} {profile['p90']:>5} "
+            f"{profile['max']:>5} {entry['reviews_per_pr']:>7}"
         )
     add("")
 
@@ -830,8 +1156,19 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "--org",
-        required=True,
-        help="Organisation URL (https://dev.azure.com/contoso) or bare organisation name.",
+        help="Organisation URL (https://dev.azure.com/contoso) or bare organisation name. "
+        "Required unless a populated --cache is being read.",
+    )
+    parser.add_argument(
+        "--cache",
+        help="Raw per-PR timeline cache. Read from it when it exists, written after a fetch. "
+        "Lets every later policy question be answered without touching the API. "
+        "Contains per-PR push timestamps — keep it local, share the --json instead.",
+    )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Ignore an existing --cache and re-fetch from the API, then overwrite it.",
     )
     parser.add_argument("--project", action="append", default=[], help="Project name. Repeatable.")
     parser.add_argument("--all-projects", action="store_true", help="Scan every project in the org.")
@@ -862,9 +1199,46 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 def main(argv: Sequence[str]) -> int:
     args = parse_args(argv)
 
+    use_cache = bool(args.cache) and os.path.exists(args.cache) and not args.refresh
+
+    if use_cache:
+        try:
+            records, meta = load_cache(args.cache)
+        except (AdoError, KeyError, json.JSONDecodeError) as exc:
+            print(f"Could not read {args.cache}: {exc}", file=sys.stderr)
+            return 1
+        print(
+            f"Loaded {len(records)} pull requests from {args.cache} "
+            f"(collected {meta.get('collected_at', 'unknown')}, no API calls made).",
+            file=sys.stderr,
+        )
+        # The window and status filter are properties of the fetch, not of the scoring, so
+        # they come from the cache rather than from this run's flags. Only the policy
+        # parameters below are re-read, which is the whole point of the cache.
+        config = {
+            **meta,
+            "quiet_seconds": args.quiet_seconds,
+            "jitter_seconds": args.jitter_seconds,
+            "max_staleness_minutes": args.max_staleness_minutes,
+            "top_repos": args.top_repos,
+            "anonymise_repos": args.anonymise_repos,
+            "source": f"cache: {args.cache}",
+        }
+        stats = build_report(records, config)
+        print(render(stats))
+        if args.json_path:
+            with open(args.json_path, "w", encoding="utf-8") as handle:
+                json.dump(stats, handle, indent=2, sort_keys=True)
+            print(f"Aggregates written to {args.json_path}", file=sys.stderr)
+        return 0
+
     pat = os.environ.get("AZDO_PAT", "").strip()
     if not pat:
         print("AZDO_PAT is not set. Create a PAT with Code (read) scope and export it.", file=sys.stderr)
+        return 2
+
+    if not args.org:
+        print("Pass --org (no cache to read from).", file=sys.stderr)
         return 2
 
     if not args.project and not args.all_projects:
@@ -948,7 +1322,28 @@ def main(argv: Sequence[str]) -> int:
         "anonymise_repos": args.anonymise_repos,
         "draft_detection": not args.no_draft_detection,
         "prs_skipped_no_iterations": failures,
+        "source": "azure devops api",
     }
+
+    if args.cache:
+        save_cache(
+            args.cache,
+            records,
+            {
+                "collected_at": datetime.now(timezone.utc).isoformat(),
+                "days": args.days,
+                "since": since.isoformat(),
+                "projects": projects,
+                "statuses": sorted(statuses),
+                "draft_detection": not args.no_draft_detection,
+                "prs_skipped_no_iterations": failures,
+            },
+        )
+        print(
+            f"Raw timelines cached to {args.cache} — re-score policies with "
+            f"--cache {args.cache} and no API calls.",
+            file=sys.stderr,
+        )
 
     stats = build_report(records, config)
     print(render(stats))

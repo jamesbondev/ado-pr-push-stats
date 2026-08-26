@@ -35,6 +35,8 @@ Useful flags:
 | `--exclude-repo NAME` | Repeatable. Skip sandboxes, archives, forks. |
 | `--quiet-seconds N` | Re-run the debounce simulation against a different quiet period. |
 | `--max-staleness-minutes N` | Likewise for the starvation bound. |
+| `--cache PATH` | Read raw timelines from PATH if it exists, write them there after a fetch. |
+| `--refresh` | Ignore an existing cache and re-fetch, then overwrite it. |
 | `--anonymise-repos` | Replace repository names with `repo-1`…`repo-N` in the output. |
 | `--no-draft-detection` | Skip the per-PR threads call. Halves the request count. |
 | `--concurrency N` | Parallel per-PR fetches. Default 8. Lower it if you get throttled. |
@@ -42,6 +44,21 @@ Useful flags:
 Cost: two API calls per pull request (iterations + threads), plus one per repository and
 one page per hundred pull requests. A 30-day window over a mid-sized org is typically a
 few thousand requests and a couple of minutes.
+
+**Pay that once.** With `--cache`, the raw per-PR push timelines are written to disk, and
+every later question — a different quiet period, a different review limit, a different
+cooldown — is re-scored from the cache with no API calls at all:
+
+```bash
+python3 pr_push_stats.py --org ... --project ... --cache raw.json      # fetches, caches
+python3 pr_push_stats.py --cache raw.json --quiet-seconds 1200         # instant, no API
+python3 pr_push_stats.py --cache raw.json --refresh --org ... --project ...   # re-fetch
+```
+
+Reading from the cache takes the window, statuses and projects from when it was collected;
+only the policy parameters are re-read from the flags. The cache holds per-PR push
+timestamps, which the aggregate report deliberately does not — **keep it local and share
+the `--json` instead.**
 
 ## What counts as a push
 
@@ -88,6 +105,35 @@ Draft pushes are excluded from the trigger set, matching a reviewer configured t
 ignore drafts; publication itself counts as one trigger, since Azure DevOps re-notifies
 with `isDraft` cleared. The alternative — reviewing drafts too — is reported as a single
 counterfactual total alongside it.
+
+## The review-limit policies
+
+Three ways to stop one pull request consuming unbounded reviews, each scored as a gate on
+the stream of reviews the debounce already decided to run. Every table reports the same
+six columns, because the interesting comparison is not which saves most:
+
+| Column | What it costs you |
+| --- | --- |
+| `reviews` / `saved` | the spend saved |
+| `comments` | how many "not ready for review" notes get posted — the noise the policy adds |
+| `PRs hit` | share of pull requests that meet the gate at all |
+| `>1 hit` | pull requests gated repeatedly, i.e. people who would find it a nuisance |
+| `unreviewed final` | **pull requests whose final push never got reviewed** — the safety cost |
+
+That last column is the one to read first. A policy that saves 40% of reviews by leaving
+a fifth of pull requests merging with their last commit unreviewed has not saved money, it
+has moved the cost somewhere that does not show up on the bill.
+
+- **Policy A — hard cap.** Once the limit is hit, the pull request is never reviewed again.
+  Reported as the floor: it is exactly what B and C degrade to when nobody resumes.
+- **Policy B — cooldown window.** On hitting the limit, comment and ignore pushes for N
+  hours; when the window expires the allowance resets. Fully determined by the data — no
+  assumption about how people would react.
+- **Policy C — consent gate.** On hitting the limit, stop until the author explicitly asks
+  to continue, which grants another allowance. Whether authors would ask cannot be read off
+  history, so it is a swept parameter: `resume=0.00` is identical to the hard cap and
+  `resume=1.00` saves nothing but a round trip. The truth sits between, and the sweep
+  brackets it rather than guessing.
 
 ## Output and data handling
 
