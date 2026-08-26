@@ -1238,9 +1238,12 @@ def render(stats: dict[str, Any]) -> str:
     add("-" * 78)
     add("REVIEW LOAD BY REPOSITORY (ranked by excess, not by rate)")
     add("-" * 78)
-    add(f"  Excess = reviews - (PRs x {load['org_reviews_per_pr']}, the org average). A large repo")
-    add("  behaving normally scores near zero; a small repo behaving badly scores small. This")
-    add("  is the ranking that answers where a change would actually recover something.")
+    add(f"  Excess = actual - (PRs x org average). Averages: {load['org_pushes_per_pr']} pushes/PR,")
+    add(f"  {load['org_reviews_per_pr']} reviews/PR. A large repo behaving normally scores near zero;")
+    add("  a small repo behaving badly scores small.")
+    add("")
+    add("  'sim rev' and 'exc rev' are MODELLED - what the debounce would let through, not a")
+    add("  count of reviews that happened. 'pushes' and 'exc push' are measured from the API.")
     add("")
     add(
         f"  {load['total_excess_reviews']} reviews sit above what PR counts predict; "
@@ -1248,14 +1251,15 @@ def render(stats: dict[str, Any]) -> str:
     )
     add("")
     add(
-        f"  {'repository':<34} {'PRs':>5} {'reviews':>8} {'rev/PR':>7} {'excess':>7} "
-        f"{'%all':>6} {'cum%exc':>8}"
+        f"  {'repository':<28} {'PRs':>5} {'pushes':>7} {'sim rev':>8} {'rev/PR':>7} "
+        f"{'exc rev':>8} {'exc push':>9} {'cum%':>6}"
     )
     for entry in load["repositories"]:
         add(
-            f"  {entry['repository'][:34]:<34} {entry['prs']:>5} {entry['reviews']:>8} "
-            f"{entry['reviews_per_pr']:>7} {entry['excess_reviews']:>7} "
-            f"{entry['pct_of_all_reviews']:>5}% {entry['cumulative_pct_of_excess']:>7}%"
+            f"  {entry['repository'][:28]:<28} {entry['prs']:>5} {entry['pushes']:>7} "
+            f"{entry['reviews']:>8} {entry['reviews_per_pr']:>7} "
+            f"{entry['excess_reviews']:>8} {entry['excess_pushes']:>9} "
+            f"{entry['cumulative_pct_of_excess']:>5}%"
         )
     add("")
 
