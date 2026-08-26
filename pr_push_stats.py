@@ -559,6 +559,7 @@ class PolicyOutcome:
     reviews: list[datetime] = field(default_factory=list)
     gate_trips: int = 0  # each trip is one "not ready for review" comment
     resume_requests: int = 0  # option 1 only: times the author had to ask
+    suppressed: int = 0  # reviews the policy removed on this pull request
 
     def final_state_reviewed(self, last_trigger: datetime | None) -> bool:
         """Did any surviving review cover the pull request's final push?
@@ -572,10 +573,16 @@ class PolicyOutcome:
 
 
 def apply_hard_cap(reviews: Sequence[datetime], limit: int) -> PolicyOutcome:
-    """Baseline for comparison: after `limit` reviews the pull request is never reviewed again."""
+    """Baseline for comparison: after `limit` reviews the pull request is never reviewed again.
+
+    A trip is counted when the limit is *reached*, matching the other two policies — that
+    is the moment a real implementation posts its comment, whether or not any further push
+    ever arrives to be suppressed.
+    """
     outcome = PolicyOutcome(reviews=list(reviews[:limit]))
-    if len(reviews) > limit:
+    if len(reviews) >= limit:
         outcome.gate_trips = 1
+    outcome.suppressed = len(reviews) - len(outcome.reviews)
     return outcome
 
 
@@ -606,6 +613,7 @@ def apply_cooldown(
             cooldown_until = moment + cooldown
             count = 0
 
+    outcome.suppressed = len(reviews) - len(outcome.reviews)
     return outcome
 
 
@@ -643,6 +651,7 @@ def apply_consent_gate(
             if will_resume:
                 outcome.resume_requests += 1
 
+    outcome.suppressed = len(reviews) - len(outcome.reviews)
     return outcome
 
 
@@ -830,6 +839,13 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
             "prs_gated": gated,
             "pct_prs_gated": round(100 * gated / len(records), 1) if records else 0.0,
             "prs_gated_more_than_once": repeat_gated,
+            # Gates that fired on a pull request nothing was ever suppressed on: the
+            # comment gets posted, the author is told to tidy up, and not one review is
+            # avoided. Pure noise, and the fix is to comment on the first suppressed
+            # push rather than on reaching the limit.
+            "gates_with_no_effect": sum(
+                1 for outcome in outcomes if outcome.gate_trips and not outcome.suppressed
+            ),
             # The safety cost: the pull request's final state never got reviewed.
             "prs_final_push_unreviewed": unreviewed_final,
             "pct_final_push_unreviewed": (
@@ -1064,13 +1080,14 @@ def render(stats: dict[str, Any]) -> str:
         add(f"  {note}")
         add("")
         add(
-            f"  {first_column:<22} {'reviews':>8} {'saved':>7} {'comments':>9} "
+            f"  {first_column:<22} {'reviews':>8} {'saved':>7} {'comments':>9} {'no-op':>6} "
             f"{'PRs hit':>8} {'>1 hit':>7} {'unreviewed final':>17}"
         )
         for label, values in rows.items():
             add(
                 f"  {label:<22} {values['reviews']:>8} {values['pct_reviews_saved']:>6}% "
-                f"{values['gate_trips']:>9} {values['pct_prs_gated']:>7}% "
+                f"{values['gate_trips']:>9} {values['gates_with_no_effect']:>6} "
+                f"{values['pct_prs_gated']:>7}% "
                 f"{values['prs_gated_more_than_once']:>7} "
                 f"{values['prs_final_push_unreviewed']:>7} ({values['pct_final_push_unreviewed']:>4}%)"
             )
