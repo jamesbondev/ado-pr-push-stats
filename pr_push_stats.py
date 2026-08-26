@@ -63,7 +63,7 @@ RESUME_RATES = (0.0, 0.25, 0.5, 0.75, 1.0)
 # profile. Without a floor the table is topped by repos with one very active PR.
 MIN_PRS_FOR_PROFILE = 5
 
-CACHE_FORMAT_VERSION = 1
+CACHE_FORMAT_VERSION = 2  # v2 adds per-push author attribution
 
 FRACTIONAL_SECONDS = re.compile(r"\.(\d{1,9})")
 
@@ -195,6 +195,7 @@ class PrRecord:
     closed_at: datetime | None
     push_times: list[datetime]
     reasons: list[str]
+    push_authors: list[str]
     draft: DraftHistory
 
 
@@ -289,12 +290,19 @@ def fetch_pr_record(
     iterations = client.get(f"{base}/iterations").get("value", [])
     push_times: list[datetime] = []
     reasons: list[str] = []
+    authors: list[str] = []
     for iteration in iterations:
         created = parse_time(iteration.get("createdDate"))
         if created is None:
             continue
         push_times.append(created)
         reasons.append(str(iteration.get("reason") or "unknown"))
+        # Who pushed, not who opened the pull request — a colleague pushing a fix to
+        # someone else's branch is a real and fairly common case.
+        identity = iteration.get("author") or {}
+        authors.append(
+            str(identity.get("displayName") or identity.get("uniqueName") or "unknown")
+        )
 
     if not push_times:
         return None
@@ -302,6 +310,7 @@ def fetch_pr_record(
     order = sorted(range(len(push_times)), key=lambda index: push_times[index])
     push_times = [push_times[index] for index in order]
     reasons = [reasons[index] for index in order]
+    authors = [authors[index] for index in order]
 
     if read_drafts:
         threads = client.get(f"{base}/threads").get("value", [])
@@ -316,6 +325,7 @@ def fetch_pr_record(
         closed_at=parse_time(pull_request.get("closedDate")),
         push_times=push_times,
         reasons=reasons,
+        push_authors=authors,
         draft=draft,
     )
 
@@ -344,6 +354,7 @@ def save_cache(path: str, records: Sequence[PrRecord], meta: dict[str, Any]) -> 
                 "closed_at": record.closed_at.isoformat() if record.closed_at else None,
                 "push_times": [moment.isoformat() for moment in record.push_times],
                 "reasons": record.reasons,
+                "push_authors": record.push_authors,
                 "draft": {
                     "started_draft": record.draft.started_draft,
                     "published_at": (
@@ -388,6 +399,7 @@ def load_cache(path: str) -> tuple[list[PrRecord], dict[str, Any]]:
                 closed_at=parse_time(item["closed_at"]),
                 push_times=push_times,
                 reasons=item["reasons"],
+                push_authors=item.get("push_authors", []),
                 draft=DraftHistory(
                     started_draft=draft["started_draft"],
                     published_at=parse_time(draft["published_at"]),
@@ -773,7 +785,7 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
     # a single month cannot distinguish a habit from the month it was measured in.
     monthly: dict[str, dict[str, int]] = {}
 
-    for record in records:
+    for index, record in enumerate(records):
         status_totals[record.status] += 1
         push_counts.append(len(record.push_times))
         reason_totals.update(record.reasons)
@@ -834,12 +846,24 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
 
         rollup = repo_rollup.setdefault(
             record.repository,
-            {"prs": 0, "pushes": 0, "reviews": 0, "push_counts": [], "gaps": [], "lifetimes": []},
+            {
+                "prs": 0,
+                "pushes": 0,
+                "reviews": 0,
+                "push_counts": [],
+                "gaps": [],
+                "lifetimes": [],
+                "author_pushes": Counter(),
+                "author_prs": {},
+            },
         )
         rollup["prs"] += 1
         rollup["pushes"] += len(record.push_times)
         rollup["reviews"] += reviews
         rollup["push_counts"].append(len(record.push_times))
+        for author in record.push_authors:
+            rollup["author_pushes"][author] += 1
+            rollup["author_prs"].setdefault(author, set()).add(index)
         # Cadence and longevity, per repo. Pushes per PR on its own cannot tell a team
         # iterating quickly from a team drip-feeding a pull request over days, and those
         # have different owners: the first is how they work, the second is usually
@@ -923,6 +947,40 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
     }
 
     for values in repo_rollup.values():
+        # Concentration, not identity. The question is whether a repo's push volume is
+        # one person or the whole team; that is answered by shares and ratios, and needs
+        # no names. A push count is a poor measure of an individual — whoever owns the
+        # hardest integration work will legitimately push most — so the default output
+        # emits none, and --name-authors is opt-in and marked not-for-sharing.
+        author_pushes: Counter[str] = values.pop("author_pushes")
+        author_prs: dict[str, set[int]] = values.pop("author_prs")
+        ranked = author_pushes.most_common()
+        total_author_pushes = sum(author_pushes.values())
+        values["distinct_authors"] = len(ranked)
+        values["top_author_share"] = (
+            round(100 * ranked[0][1] / total_author_pushes, 1) if ranked else 0.0
+        )
+        values["top3_author_share"] = (
+            round(100 * sum(count for _, count in ranked[:3]) / total_author_pushes, 1)
+            if ranked
+            else 0.0
+        )
+        # Rate, not volume: someone who simply opens more pull requests is not the same
+        # as someone who pushes more times to each one. Only the second is a habit.
+        rates = sorted(
+            author_pushes[name] / len(author_prs[name]) for name in author_pushes
+        )
+        median_rate = percentile(rates, 0.5) or 0.0
+        values["busiest_author_rate"] = round(max(rates), 2) if rates else 0.0
+        values["median_author_rate"] = round(median_rate, 2)
+        values["busiest_over_median"] = (
+            round(max(rates) / median_rate, 2) if rates and median_rate else 0.0
+        )
+        values["named_top_authors"] = (
+            [{"author": name, "pushes": count} for name, count in ranked[:3]]
+            if config.get("name_authors")
+            else []
+        )
         repo_gaps = values.pop("gaps")
         repo_lifetimes = values.pop("lifetimes")
         values["median_gap_hours"] = (
@@ -1074,6 +1132,21 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
         "pr_lifetime_hours": summarise(lifetimes_hours),
         "top_repositories_by_reviews": top_repos,
         "top_repositories_by_pushes_per_pr": push_offenders,
+        "author_concentration": [
+            {
+                "repository": entry["repository"],
+                "prs": entry["prs"],
+                "pushes": entry["pushes"],
+                "distinct_authors": entry["distinct_authors"],
+                "top_author_share": entry["top_author_share"],
+                "top3_author_share": entry["top3_author_share"],
+                "busiest_author_rate": entry["busiest_author_rate"],
+                "median_author_rate": entry["median_author_rate"],
+                "busiest_over_median": entry["busiest_over_median"],
+                "named_top_authors": entry["named_top_authors"],
+            }
+            for entry in push_offenders
+        ],
         "repository_review_load": {
             "org_reviews_per_pr": round(org_reviews_per_pr, 2),
             "org_pushes_per_pr": round(org_pushes_per_pr, 2),
@@ -1262,6 +1335,42 @@ def render(stats: dict[str, Any]) -> str:
         )
     add("")
 
+    concentration = stats["author_concentration"]
+    if concentration:
+        add("-" * 78)
+        add("AUTHOR CONCENTRATION (is it a person, or the team?)")
+        add("-" * 78)
+        add("  'top1%' is the share of a repo's pushes from its single busiest author.")
+        add("  'peak/med' compares that author's pushes-PER-PR against the repo's median")
+        add("  author - a RATE, so someone who simply opens more pull requests does not")
+        add("  register. Near 1.0 means the pattern is structural and applies to everyone;")
+        add("  well above 1.0 means one person works differently from their colleagues.")
+        add("")
+        add("  A push count is a poor measure of an individual - whoever owns the hardest")
+        add("  integration work will legitimately push most. Use this to choose what to ask,")
+        add("  never to appraise anyone.")
+        add("")
+        add(
+            f"  {'repository':<26} {'PRs':>4} {'push':>6} {'authors':>8} {'top1%':>6} "
+            f"{'top3%':>6} {'peak/med':>9}"
+        )
+        for entry in concentration:
+            add(
+                f"  {entry['repository'][:26]:<26} {entry['prs']:>4} {entry['pushes']:>6} "
+                f"{entry['distinct_authors']:>8} {entry['top_author_share']:>5}% "
+                f"{entry['top3_author_share']:>5}% {entry['busiest_over_median']:>9}"
+            )
+        if any(entry["named_top_authors"] for entry in concentration):
+            add("")
+            add("  !! --name-authors: the rows below identify people. NOT for sharing.")
+            for entry in concentration:
+                if entry["named_top_authors"]:
+                    names = ", ".join(
+                        f"{a['author']} ({a['pushes']})" for a in entry["named_top_authors"]
+                    )
+                    add(f"    {entry['repository'][:26]:<26} {names}")
+        add("")
+
     load = stats["repository_review_load"]
     add("-" * 78)
     add("REVIEW LOAD BY REPOSITORY (ranked by excess, not by rate)")
@@ -1375,6 +1484,13 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--top-repos", type=int, default=10)
     parser.add_argument("--anonymise-repos", action="store_true", help="Replace repo names with repo-N.")
     parser.add_argument(
+        "--name-authors",
+        action="store_true",
+        help="Also print the three busiest authors per repository BY NAME. Off by default: "
+        "the concentration figures answer 'person or team?' without identifying anyone, "
+        "and output produced with this flag should not be shared.",
+    )
+    parser.add_argument(
         "--no-draft-detection",
         action="store_true",
         help="Skip the threads call. Halves the request count, loses the draft timeline.",
@@ -1409,6 +1525,7 @@ def main(argv: Sequence[str]) -> int:
             "max_staleness_minutes": args.max_staleness_minutes,
             "top_repos": args.top_repos,
             "anonymise_repos": args.anonymise_repos,
+            "name_authors": args.name_authors,
             "source": f"cache: {args.cache}",
         }
         stats = build_report(records, config)
@@ -1507,6 +1624,7 @@ def main(argv: Sequence[str]) -> int:
         "max_staleness_minutes": args.max_staleness_minutes,
         "top_repos": args.top_repos,
         "anonymise_repos": args.anonymise_repos,
+        "name_authors": args.name_authors,
         "draft_detection": not args.no_draft_detection,
         "prs_skipped_no_iterations": failures,
         "source": "azure devops api",
