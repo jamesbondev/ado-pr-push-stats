@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Report output — aggregates only, but no reason to version scan results.
+*.json
+!*.example.json
