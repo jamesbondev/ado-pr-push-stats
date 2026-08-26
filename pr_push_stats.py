@@ -929,6 +929,51 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
         eligible, key=lambda item: item["pushes_per_pr"]["mean"], reverse=True
     )[: config["top_repos"]]
 
+    # Excess: reviews above what this repo's pull request count would predict at the
+    # org-wide average. Ranking by rate alone answers "who has the habit" and is dominated
+    # by small repos, where a handful of busy pull requests moves the mean a long way and
+    # the absolute load is negligible. Excess answers the different question — "where would
+    # a change actually recover something" — and needs no minimum-PR floor, because a small
+    # repo can only ever accumulate a small excess. A repo sitting exactly on the org
+    # average scores zero; one below it scores negative.
+    org_reviews_per_pr = total_reviews / len(records) if records else 0.0
+    org_pushes_per_pr = sum(push_counts) / len(records) if records else 0.0
+
+    load_ranked = sorted(
+        (
+            {
+                "repository": name,
+                "prs": values["prs"],
+                "pushes": values["pushes"],
+                "reviews": values["reviews"],
+                "reviews_per_pr": values["reviews_per_pr"],
+                "excess_reviews": round(values["reviews"] - values["prs"] * org_reviews_per_pr),
+                "excess_pushes": round(values["pushes"] - values["prs"] * org_pushes_per_pr),
+                "pct_of_all_reviews": (
+                    round(100 * values["reviews"] / total_reviews, 1) if total_reviews else 0.0
+                ),
+            }
+            for name, values in repo_rollup.items()
+        ),
+        key=lambda item: item["excess_reviews"],
+        reverse=True,
+    )
+
+    total_excess = sum(item["excess_reviews"] for item in load_ranked if item["excess_reviews"] > 0)
+    running = 0
+    repos_to_half_excess = 0
+    for item in load_ranked:
+        if item["excess_reviews"] <= 0 or running >= total_excess / 2:
+            break
+        running += item["excess_reviews"]
+        repos_to_half_excess += 1
+
+    load_ranked = load_ranked[: config["top_repos"]]
+    cumulative = 0.0
+    for item in load_ranked:
+        cumulative += item["excess_reviews"] / total_excess * 100 if total_excess else 0
+        item["cumulative_pct_of_excess"] = round(cumulative, 1)
+
     top_repos = sorted(
         (
             {"repository": name, **values}
@@ -939,7 +984,7 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
     )[: config["top_repos"]]
     if config["anonymise_repos"]:
         aliases: dict[str, str] = {}
-        for entry in [*top_repos, *push_offenders]:
+        for entry in [*top_repos, *push_offenders, *load_ranked]:
             alias = aliases.setdefault(entry["repository"], f"repo-{len(aliases) + 1}")
             entry["repository"] = alias
 
@@ -1001,6 +1046,13 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
         "pr_lifetime_hours": summarise(lifetimes_hours),
         "top_repositories_by_reviews": top_repos,
         "top_repositories_by_pushes_per_pr": push_offenders,
+        "repository_review_load": {
+            "org_reviews_per_pr": round(org_reviews_per_pr, 2),
+            "org_pushes_per_pr": round(org_pushes_per_pr, 2),
+            "total_excess_reviews": total_excess,
+            "repos_holding_half_the_excess": repos_to_half_excess,
+            "repositories": load_ranked,
+        },
         "data_quality": {
             "draft_property_keys_seen": dict(draft_property_keys.most_common()),
             "prs_with_undetermined_draft_state": draft_undetermined,
@@ -1182,9 +1234,36 @@ def render(stats: dict[str, Any]) -> str:
         )
     add("")
 
+    load = stats["repository_review_load"]
     add("-" * 78)
-    add(f"PUSH-HEAVIEST REPOSITORIES (mean pushes per PR, min {MIN_PRS_FOR_PROFILE} PRs)")
+    add("REVIEW LOAD BY REPOSITORY (ranked by excess, not by rate)")
     add("-" * 78)
+    add(f"  Excess = reviews - (PRs x {load['org_reviews_per_pr']}, the org average). A large repo")
+    add("  behaving normally scores near zero; a small repo behaving badly scores small. This")
+    add("  is the ranking that answers where a change would actually recover something.")
+    add("")
+    add(
+        f"  {load['total_excess_reviews']} reviews sit above what PR counts predict; "
+        f"{load['repos_holding_half_the_excess']} repositories hold half of that."
+    )
+    add("")
+    add(
+        f"  {'repository':<34} {'PRs':>5} {'reviews':>8} {'rev/PR':>7} {'excess':>7} "
+        f"{'%all':>6} {'cum%exc':>8}"
+    )
+    for entry in load["repositories"]:
+        add(
+            f"  {entry['repository'][:34]:<34} {entry['prs']:>5} {entry['reviews']:>8} "
+            f"{entry['reviews_per_pr']:>7} {entry['excess_reviews']:>7} "
+            f"{entry['pct_of_all_reviews']:>5}% {entry['cumulative_pct_of_excess']:>7}%"
+        )
+    add("")
+
+    add("-" * 78)
+    add(f"PUSH-HEAVIEST REPOSITORIES (rate: mean pushes per PR, min {MIN_PRS_FOR_PROFILE} PRs)")
+    add("-" * 78)
+    add("  Who has the habit, regardless of size. Cross-reference with excess above before")
+    add("  acting: a high rate on a handful of PRs is a conversation, not a capacity problem.")
     add(
         f"  {'repository':<34} {'PRs':>5} {'min':>4} {'med':>5} {'mean':>6} "
         f"{'p90':>5} {'max':>5} {'rev/PR':>7}"
