@@ -753,6 +753,61 @@ def gap_buckets(gaps_seconds: Iterable[float], quiet_seconds: int) -> dict[str, 
     return buckets
 
 
+def measured_only(stats: dict[str, Any]) -> dict[str, Any]:
+    """Strip every modelled figure, leaving only what was measured from the API.
+
+    The report mixes two kinds of number. Push counts, gaps, lifetimes and draft
+    transitions are observations. Review counts and everything derived from them are the
+    output of a debounce simulator, which encodes one reading of one implementation — and
+    on a repository that may not even be onboarded, they describe a hypothetical.
+
+    Handing the whole report to an outside reviewer imports those assumptions without
+    flagging them, and the policy tables additionally pre-commit the reader to the three
+    options we happened to think of. This returns the half that is safe to hand over.
+    """
+    repositories = [
+        {
+            "repository": entry["repository"],
+            "prs": entry["prs"],
+            "pushes": entry["pushes"],
+            "pushes_per_pr": entry["pushes_per_pr"],
+            "excess_pushes": entry["excess_pushes"],
+            "median_gap_hours": entry["median_gap_hours"],
+            "median_lifetime_hours": entry["median_lifetime_hours"],
+            "distinct_authors": entry["distinct_authors"],
+            "top_author_share": entry["top_author_share"],
+            "busiest_over_median": entry["busiest_over_median"],
+        }
+        for entry in stats["top_repositories_by_pushes_per_pr"]
+    ]
+    return {
+        "provenance": {
+            key: stats["config"][key]
+            for key in ("days", "since", "projects", "statuses", "draft_detection")
+            if key in stats["config"]
+        },
+        "scope": stats["scope"],
+        "pushes": {
+            key: value
+            for key, value in stats["pushes"].items()
+            if key not in ("after_publish_per_pr", "after_publish_histogram")
+        },
+        "gaps_between_pushes_seconds": stats["gaps_between_pushes_seconds"],
+        "draft_lifecycle": {
+            key: value
+            for key, value in stats["draft_lifecycle"].items()
+            if key != "reviews_if_drafts_were_reviewed"
+        },
+        "pr_lifetime_hours": stats["pr_lifetime_hours"],
+        "monthly_volume": {
+            month: {k: v for k, v in values.items() if k not in ("reviews", "reviews_per_pr")}
+            for month, values in stats["monthly_volume"].items()
+        },
+        "repositories": repositories,
+        "data_quality": stats["data_quality"],
+    }
+
+
 def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[str, Any]:
     quiet_seconds = config["quiet_seconds"] + config["jitter_seconds"] / 2
     quiet = timedelta(seconds=quiet_seconds)
@@ -1496,7 +1551,22 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Skip the threads call. Halves the request count, loses the draft timeline.",
     )
     parser.add_argument("--json", dest="json_path", help="Also write the aggregates to this JSON file.")
+    parser.add_argument(
+        "--measured-only",
+        dest="measured_path",
+        help="Write a JSON containing ONLY figures measured from the API - no debounce "
+        "simulation, no policy tables, no review counts. Use this when handing the data to "
+        "anyone who should reach their own conclusions rather than inherit ours.",
+    )
     return parser.parse_args(argv)
+
+
+def write_measured(args: argparse.Namespace, stats: dict[str, Any]) -> None:
+    if not args.measured_path:
+        return
+    with open(args.measured_path, "w", encoding="utf-8") as handle:
+        json.dump(measured_only(stats), handle, indent=2, sort_keys=True)
+    print(f"Measured-only aggregates written to {args.measured_path}", file=sys.stderr)
 
 
 def main(argv: Sequence[str]) -> int:
@@ -1534,6 +1604,7 @@ def main(argv: Sequence[str]) -> int:
             with open(args.json_path, "w", encoding="utf-8") as handle:
                 json.dump(stats, handle, indent=2, sort_keys=True)
             print(f"Aggregates written to {args.json_path}", file=sys.stderr)
+        write_measured(args, stats)
         return 0
 
     pat = os.environ.get("AZDO_PAT", "").strip()
@@ -1658,6 +1729,7 @@ def main(argv: Sequence[str]) -> int:
             json.dump(stats, handle, indent=2, sort_keys=True)
         print(f"Aggregates written to {args.json_path}", file=sys.stderr)
 
+    write_measured(args, stats)
     return 0
 
 
