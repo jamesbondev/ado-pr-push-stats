@@ -833,12 +833,25 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
         bucket["reviews"] += reviews
 
         rollup = repo_rollup.setdefault(
-            record.repository, {"prs": 0, "pushes": 0, "reviews": 0, "push_counts": []}
+            record.repository,
+            {"prs": 0, "pushes": 0, "reviews": 0, "push_counts": [], "gaps": [], "lifetimes": []},
         )
         rollup["prs"] += 1
         rollup["pushes"] += len(record.push_times)
         rollup["reviews"] += reviews
         rollup["push_counts"].append(len(record.push_times))
+        # Cadence and longevity, per repo. Pushes per PR on its own cannot tell a team
+        # iterating quickly from a team drip-feeding a pull request over days, and those
+        # have different owners: the first is how they work, the second is usually
+        # something upstream of them (review turnaround, flaky CI) making them wait.
+        rollup["gaps"].extend(
+            (later - earlier).total_seconds()
+            for earlier, later in zip(record.push_times, record.push_times[1:])
+        )
+        if record.closed_at:
+            rollup["lifetimes"].append(
+                (record.closed_at - record.created_at).total_seconds() / 3600
+            )
 
     total_triggers = sum(eligible_triggers)
     total_reviews = sum(simulated_reviews)
@@ -910,6 +923,14 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
     }
 
     for values in repo_rollup.values():
+        repo_gaps = values.pop("gaps")
+        repo_lifetimes = values.pop("lifetimes")
+        values["median_gap_hours"] = (
+            round((percentile(repo_gaps, 0.5) or 0) / 3600, 1) if repo_gaps else 0.0
+        )
+        values["median_lifetime_hours"] = (
+            round(percentile(repo_lifetimes, 0.5) or 0, 1) if repo_lifetimes else 0.0
+        )
         counts = [float(count) for count in values.pop("push_counts")]
         values["pushes_per_pr"] = {
             "min": int(min(counts)),
@@ -920,13 +941,20 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
         }
         values["reviews_per_pr"] = round(values["reviews"] / values["prs"], 2)
 
+    org_push_avg = sum(push_counts) / len(records) if records else 0.0
     eligible = [
-        {"repository": name, **values}
+        {
+            "repository": name,
+            **values,
+            "excess_pushes": round(values["pushes"] - values["prs"] * org_push_avg),
+        }
         for name, values in repo_rollup.items()
         if values["prs"] >= MIN_PRS_FOR_PROFILE
     ]
     push_offenders = sorted(
-        eligible, key=lambda item: item["pushes_per_pr"]["mean"], reverse=True
+        eligible,
+        key=lambda item: item["pushes"] - item["prs"] * (sum(push_counts) / max(len(records), 1)),
+        reverse=True,
     )[: config["top_repos"]]
 
     # Excess: reviews above what this repo's pull request count would predict at the
@@ -1264,20 +1292,26 @@ def render(stats: dict[str, Any]) -> str:
     add("")
 
     add("-" * 78)
-    add(f"PUSH-HEAVIEST REPOSITORIES (rate: mean pushes per PR, min {MIN_PRS_FOR_PROFILE} PRs)")
+    add(f"PUSH BEHAVIOUR BY REPOSITORY (measured only, min {MIN_PRS_FOR_PROFILE} PRs)")
     add("-" * 78)
-    add("  Who has the habit, regardless of size. Cross-reference with excess above before")
-    add("  acting: a high rate on a handful of PRs is a conversation, not a capacity problem.")
+    add("  Ranked by excess pushes over the org average. Every column here is measured from")
+    add("  the API - nothing modelled - so it stands up in a conversation about process.")
+    add("")
+    add("  Read 'med' with 'gap h' and 'life h'. Many pushes at short gaps on a short-lived")
+    add("  pull request is fast iteration. The same push count at long gaps on a pull request")
+    add("  open for days is drip-feeding - and that is usually caused by something upstream")
+    add("  of the team (review turnaround, flaky CI), not by the team.")
+    add("")
     add(
-        f"  {'repository':<34} {'PRs':>5} {'min':>4} {'med':>5} {'mean':>6} "
-        f"{'p90':>5} {'max':>5} {'rev/PR':>7}"
+        f"  {'repository':<28} {'PRs':>4} {'push':>6} {'med':>4} {'p90':>5} "
+        f"{'exc':>6} {'gap h':>7} {'life h':>7}"
     )
     for entry in stats["top_repositories_by_pushes_per_pr"]:
         profile = entry["pushes_per_pr"]
         add(
-            f"  {entry['repository'][:34]:<34} {entry['prs']:>5} {profile['min']:>4} "
-            f"{profile['median']:>5} {profile['mean']:>6} {profile['p90']:>5} "
-            f"{profile['max']:>5} {entry['reviews_per_pr']:>7}"
+            f"  {entry['repository'][:28]:<28} {entry['prs']:>4} {entry['pushes']:>6} "
+            f"{profile['median']:>4} {profile['p90']:>5} {entry['excess_pushes']:>6} "
+            f"{entry['median_gap_hours']:>7} {entry['median_lifetime_hours']:>7}"
         )
     add("")
 
