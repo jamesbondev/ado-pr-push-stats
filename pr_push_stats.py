@@ -808,6 +808,101 @@ def measured_only(stats: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def render_flat(stats: dict[str, Any]) -> str:
+    """The measured aggregates as dense prefixed lines, for transcription.
+
+    JSON is the wrong shape when the only way off the machine is a photograph of a
+    terminal: braces and indentation spend most of the pixels on punctuation. This is the
+    same content as measured_only(), one record per line, every line under 78 characters,
+    with a legend so it can be read back without guessing at column meanings.
+    """
+    def pack(prefix: str, pairs: dict[str, Any]) -> list[str]:
+        """key=value pairs wrapped at 78 chars, repeating the prefix on continuations."""
+        out: list[str] = []
+        current = prefix
+        for key, value in pairs.items():
+            token = f" {key}={value}"
+            if len(current) + len(token) > 78:
+                out.append(current)
+                current = prefix
+            current += token
+        out.append(current)
+        return out
+
+    def summary(prefix: str, values: dict[str, Any], nd: int = 1) -> list[str]:
+        if not values.get("count"):
+            return [f"{prefix} n=0"]
+        rounded = {
+            ("n" if k == "count" else k): (
+                (int(round(v)) if nd == 0 else round(v, nd)) if isinstance(v, float) else v
+            )
+            for k, v in values.items()
+        }
+        return pack(prefix, rounded)
+
+    data = measured_only(stats)
+    lines: list[str] = []
+    add = lines.append
+
+    add("### MEASURED-ONLY EXPORT (flat) ###")
+    add("# legend: WIN=window SCOPE=totals PUSH=pushes/PR PHIST=push histogram")
+    add("# REASON=iteration reasons GAP=gaps(sec) GAPB=gap buckets DRAFT=draft split")
+    add("# DPUB=hours to publish DPUSH=pushes while draft LIFE=PR lifetime(h)")
+    add("# MON=month prs pushes pushes/PR   DQ=data quality")
+    add("# REPO=name prs push medpush p90push exc gap_h life_h auth top1% peak/med")
+
+    prov, scope = data["provenance"], data["scope"]
+    lines.extend(pack("WIN", {"days": prov.get("days"),
+                              "since": str(prov.get("since"))[:10],
+                              "proj": ",".join(prov.get("projects", []))[:24]}))
+    lines.extend(pack("SCOPE", {"prs": scope["pull_requests"],
+                                "repos": scope["repositories_with_prs"],
+                                **scope["status_breakdown"]}))
+
+    pushes = data["pushes"]
+    lines.extend(summary("PUSH", pushes["per_pr"]))
+    lines.extend(pack("PHIST", pushes["per_pr_histogram"]))
+    lines.extend(pack("REASON", {**pushes["by_reason"], "total": pushes["total"]}))
+
+    gaps = data["gaps_between_pushes_seconds"]
+    # Seconds to whole numbers: two decimal places on a 4,647,923-second maximum is
+    # precision nobody transcribing this by eye can use, and it costs line width.
+    lines.extend(summary("GAP", {**gaps["summary"], "count": gaps["total_gaps"]}, nd=0))
+    lines.extend(pack("GAPB", {
+        label.split("(")[0].strip().replace(" ", ""): count
+        for label, count in gaps["buckets"].items()
+    }))
+
+    draft = data["draft_lifecycle"]
+    lines.extend(pack("DRAFT", {"pub": draft["started_published"],
+                                "draft": draft["started_draft"],
+                                "undet": draft["undetermined"],
+                                "pct": draft["pct_started_draft"],
+                                "mtoggle": draft["toggled_draft_more_than_once"]}))
+    lines.extend(summary("DPUB", draft["hours_create_to_publish"]))
+    lines.extend(summary("DPUSH", draft["pushes_while_draft"]))
+    lines.extend(summary("LIFE", data["pr_lifetime_hours"]))
+
+    for month, values in data["monthly_volume"].items():
+        add(f"MON {month} {values['prs']} {values['pushes']} {values['pushes_per_pr']}")
+
+    for entry in data["repositories"]:
+        profile = entry["pushes_per_pr"]
+        add(
+            f"REPO {entry['repository'][:24]} {entry['prs']} {entry['pushes']} "
+            f"{profile['median']} {profile['p90']} {entry['excess_pushes']} "
+            f"{entry['median_gap_hours']} {entry['median_lifetime_hours']} "
+            f"{entry['distinct_authors']} {entry['top_author_share']} "
+            f"{entry['busiest_over_median']}"
+        )
+
+    quality = data["data_quality"]
+    lines.extend(pack("DQ", {"draftevents": quality["prs_with_any_draft_transition_event"],
+                             "unknown": quality["prs_with_undetermined_draft_state"]}))
+    add("### END ###")
+    return "\n".join(lines)
+
+
 def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[str, Any]:
     quiet_seconds = config["quiet_seconds"] + config["jitter_seconds"] / 2
     quiet = timedelta(seconds=quiet_seconds)
@@ -1552,6 +1647,12 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument("--json", dest="json_path", help="Also write the aggregates to this JSON file.")
     parser.add_argument(
+        "--flat",
+        action="store_true",
+        help="Print the measured-only aggregates as dense prefixed lines instead of JSON - "
+        "built to be screenshotted and read back when the file cannot leave the machine.",
+    )
+    parser.add_argument(
         "--measured-only",
         dest="measured_path",
         help="Write a JSON containing ONLY figures measured from the API - no debounce "
@@ -1562,6 +1663,9 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 
 def write_measured(args: argparse.Namespace, stats: dict[str, Any]) -> None:
+    if args.flat:
+        print()
+        print(render_flat(stats))
     if not args.measured_path:
         return
     with open(args.measured_path, "w", encoding="utf-8") as handle:
