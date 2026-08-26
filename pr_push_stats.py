@@ -1039,7 +1039,8 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
             debounce_review_times(triggers, quiet, max_staleness, rereview_quiet)
         )
         reviews_lost_to_close += scheduled - len(review_times)
-        if triggers and not any(t >= triggers[-1] for t in review_times):
+        final_unreviewed = bool(triggers) and not any(t >= triggers[-1] for t in review_times)
+        if final_unreviewed:
             prs_final_state_unreviewed += 1
         reviews = len(review_times)
         simulated_reviews.append(reviews)
@@ -1065,12 +1066,19 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
                 "lifetimes": [],
                 "author_pushes": Counter(),
                 "author_prs": {},
+                # An org-wide coverage figure is an average over repositories whose pull
+                # requests close at wildly different speeds. A repo closing in 3 hours
+                # loses far more final reviews than one closing in 5 days, and the team on
+                # the wrong end of that experiences a materially worse service than the
+                # headline number describes.
+                "final_unreviewed": 0,
             },
         )
         rollup["prs"] += 1
         rollup["pushes"] += len(record.push_times)
         rollup["reviews"] += reviews
         rollup["push_counts"].append(len(record.push_times))
+        rollup["final_unreviewed"] += 1 if final_unreviewed else 0
         for author in record.push_authors:
             rollup["author_pushes"][author] += 1
             rollup["author_prs"].setdefault(author, set()).add(index)
@@ -1208,6 +1216,7 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
             "max": int(max(counts)),
         }
         values["reviews_per_pr"] = round(values["reviews"] / values["prs"], 2)
+        values["pct_final_unreviewed"] = round(100 * values["final_unreviewed"] / values["prs"], 1)
 
     org_push_avg = sum(push_counts) / len(records) if records else 0.0
     eligible = [
@@ -1405,6 +1414,20 @@ def build_report(records: Sequence[PrRecord], config: dict[str, Any]) -> dict[st
             }
             for entry in push_offenders
         ],
+        "coverage_by_repository": sorted(
+            (
+                {
+                    "repository": name,
+                    "prs": values["prs"],
+                    "median_lifetime_hours": values["median_lifetime_hours"],
+                    "final_unreviewed": values["final_unreviewed"],
+                    "pct_final_unreviewed": values["pct_final_unreviewed"],
+                }
+                for name, values in repo_rollup.items()
+                if values["prs"] >= MIN_PRS_FOR_PROFILE
+            ),
+            key=lambda item: (-item["pct_final_unreviewed"], -item["prs"]),
+        )[: config["top_repos"]],
         "repository_review_load": {
             "org_reviews_per_pr": round(org_reviews_per_pr, 2),
             "org_pushes_per_pr": round(org_pushes_per_pr, 2),
@@ -1621,6 +1644,26 @@ def render(stats: dict[str, Any]) -> str:
             f"{entry['pushes']:>8} {entry['reviews']:>9}"
         )
     add("")
+
+    coverage = stats["coverage_by_repository"]
+    if coverage and any(entry["final_unreviewed"] for entry in coverage):
+        overall = stats["debounce_simulation"]["pct_final_state_unreviewed"]
+        add("-" * 78)
+        add("COVERAGE BY REPOSITORY (who actually bears the unreviewed-final cost)")
+        add("-" * 78)
+        add(f"  Org-wide the modelled window leaves {overall}% of pull requests with an")
+        add("  unreviewed final state. That is an average over repositories whose pull")
+        add("  requests close at very different speeds, and it is not what any one team")
+        add("  experiences. Worst-affected first; short-lived pull requests lose most.")
+        add("")
+        add(f"  {'repository':<32} {'PRs':>5} {'life h':>8} {'unrev':>7} {'% of PRs':>10}")
+        for entry in coverage:
+            add(
+                f"  {entry['repository'][:32]:<32} {entry['prs']:>5} "
+                f"{entry['median_lifetime_hours']:>8} {entry['final_unreviewed']:>7} "
+                f"{entry['pct_final_unreviewed']:>9}%"
+            )
+        add("")
 
     concentration = stats["author_concentration"]
     if concentration:
