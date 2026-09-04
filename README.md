@@ -210,6 +210,14 @@ Consequences worth knowing:
 - **Each repository is written as it finishes**, so an interrupted run keeps what it earned.
 - **Pull requests whose merge commits the service has collected are recorded as unavailable**
   rather than retried forever. `--retry-unavailable` overrides that.
+- **A long run is interruptible.** Progress reaches disk every 50 pull requests within a
+  repository as well as at each repository boundary, so Ctrl-C or a crash costs minutes rather
+  than the run. Re-running continues from where it stopped.
+- **A failed clone is not recorded as missing history.** It leaves the repository absent from the
+  cache so the next run retries it, rather than baking a transient network failure in as
+  "these commits are gone" for every pull request in it.
+- **Every git call has a timeout**, so a stalled fetch cannot hang an overnight run, and one bad
+  pull request is logged and skipped rather than ending it.
 - **The cache holds file paths**, which are more revealing than anything the report emits. It is a
   local working file; the `--json` report is the shareable artefact. Add `cache/` to `.gitignore`.
 

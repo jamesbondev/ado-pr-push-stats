@@ -306,10 +306,21 @@ def clone_repo(remote_url: str, pat: str, dest: str, quiet: bool) -> bool:
     costs forty network calls. Paying once up front is far cheaper across a repository's history.
     """
     cmd = ["git", *auth_args(pat), "clone", "--bare", "--quiet", remote_url, dest]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0 and not quiet:
-        print(f"    clone failed: {result.stderr.strip()[:160]}", file=sys.stderr)
-    return result.returncode == 0
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=GIT_CLONE_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        if not quiet:
+            print(f"    clone timed out after {GIT_CLONE_TIMEOUT_SECONDS}s", file=sys.stderr)
+        shutil.rmtree(dest, ignore_errors=True)
+        return False
+    if result.returncode != 0:
+        if not quiet:
+            print(f"    clone failed: {result.stderr.strip()[:160]}", file=sys.stderr)
+        # A half-written clone would be treated as usable on the next run.
+        shutil.rmtree(dest, ignore_errors=True)
+        return False
+    return True
 
 
 def commits_present(repo_dir: str, shas: Sequence[str]) -> set[str]:
@@ -322,11 +333,14 @@ def commits_present(repo_dir: str, shas: Sequence[str]) -> set[str]:
     if not unique:
         return set()
 
-    probe = subprocess.run(
-        ["git", "-C", repo_dir, "cat-file", "--batch-check"],
-        input="\n".join(f"{sha}^{{commit}}" for sha in unique),
-        capture_output=True, text=True,
-    )
+    try:
+        probe = subprocess.run(
+            ["git", "-C", repo_dir, "cat-file", "--batch-check"],
+            input="\n".join(f"{sha}^{{commit}}" for sha in unique),
+            capture_output=True, text=True, timeout=GIT_DIFF_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return set()
     present: set[str] = set()
     for sha, line in zip(unique, probe.stdout.splitlines()):
         if " commit " in line:
@@ -343,10 +357,13 @@ def fetch_missing(repo_dir: str, pat: str, shas: Sequence[str]) -> None:
     missing = [sha for sha in dict.fromkeys(shas) if sha not in present]
     if not missing:
         return
-    subprocess.run(
-        ["git", "-C", repo_dir, *auth_args(pat), "fetch", "--quiet", "origin", *missing],
-        capture_output=True, text=True,
-    )
+    try:
+        subprocess.run(
+            ["git", "-C", repo_dir, *auth_args(pat), "fetch", "--quiet", "origin", *missing],
+            capture_output=True, text=True, timeout=GIT_FETCH_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def numstat(repo_dir: str, base_sha: str, head_sha: str) -> list[list[Any]] | None:
@@ -357,11 +374,15 @@ def numstat(repo_dir: str, base_sha: str, head_sha: str) -> list[list[Any]] | No
     the same context width the reviewer sees rather than reconstructed from a per-line average.
     git fails cleanly on a missing object, so no separate existence probe is needed.
     """
-    result = subprocess.run(
-        ["git", "-C", repo_dir, "diff", "--numstat", "--patch",
-         f"-U{DIFF_CONTEXT_LINES}", f"{base_sha}...{head_sha}"],
-        capture_output=True, text=True, errors="replace",
-    )
+    try:
+        result = subprocess.run(
+            ["git", "-C", repo_dir, "diff", "--numstat", "--patch",
+             f"-U{DIFF_CONTEXT_LINES}", f"{base_sha}...{head_sha}"],
+            capture_output=True, text=True, errors="replace",
+            timeout=GIT_DIFF_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return None
     if result.returncode != 0:
         return None
 
@@ -406,6 +427,16 @@ def numstat(repo_dir: str, base_sha: str, head_sha: str) -> list[list[Any]] | No
 # --------------------------------------------------------------------------- #
 
 CACHE_FORMAT_VERSION = 1
+
+# A git call that stalls on a half-open connection would otherwise hang the whole run. Clones are
+# given far longer than diffs because a large repository legitimately takes minutes.
+GIT_CLONE_TIMEOUT_SECONDS = 1800
+GIT_FETCH_TIMEOUT_SECONDS = 600
+GIT_DIFF_TIMEOUT_SECONDS = 120
+
+# How often a repository's progress reaches disk. A repository with thousands of pull requests
+# would otherwise lose an hour's work to one interruption.
+CHECKPOINT_EVERY = 50
 
 
 def repo_slug(project: str, repo_name: str) -> str:
@@ -910,14 +941,32 @@ def main(argv: Sequence[str]) -> int:
                 cache.hits += len(prs) - len(pending)
                 cache.misses += len(pending)
 
+                # Report from what is cached and fetch nothing, so re-scoring a rule set over the
+                # corpus costs no network and no git.
+                if args.no_fetch:
+                    pending = []
+
                 repo_dir = None
-                if pending and not args.no_fetch:
+                if pending:
                     repo_dir = cache.clone_dir(project, repo["name"])
                     if not os.path.isdir(repo_dir):
                         if not args.quiet:
                             print(f"    cloning {repo['name']}...", file=sys.stderr, flush=True)
                         if not clone_repo(repo["remoteUrl"], pat, repo_dir, args.quiet):
                             repo_dir = None
+
+                    # Without a clone there is nothing to measure, and recording these as
+                    # unreachable would bake a transient network failure into the cache for every
+                    # pull request in the repository. Leave them absent and try again next run.
+                    if repo_dir is None:
+                        if not args.quiet:
+                            print(f"    {repo['name']}: skipped, no clone", file=sys.stderr)
+                        rows.extend(
+                            build_row(f"{project}/{repo['name']}", entry)
+                            for entry in entries.values()
+                            if within_window(entry, since)
+                        )
+                        continue
 
                     if repo_dir:
                         # One fetch for the whole repository rather than one per pull request.
@@ -936,18 +985,28 @@ def main(argv: Sequence[str]) -> int:
                         print(f"    {repo['name']}: {index}/{len(pending)} new",
                               file=sys.stderr, flush=True)
 
+                    # Progress reaches disk periodically, so an interruption inside a repository
+                    # with thousands of pull requests costs minutes rather than the whole of it.
+                    if index % CHECKPOINT_EVERY == 0:
+                        cache.save_repo(project, repo["name"], entries,
+                                        repo["id"], listing_truncated)
+
                     pr_id = pr["pullRequestId"]
                     base = (pr.get("lastMergeTargetCommit") or {}).get("commitId")
                     head = (pr.get("lastMergeSourceCommit") or {}).get("commitId")
 
                     try:
                         ado_order = pr_file_changes(client, project, repo["id"], pr_id)
+                        files = numstat(repo_dir, base, head) if (repo_dir and base and head) else None
                     except AdoError:
+                        continue
+                    except Exception as exc:  # noqa: BLE001 - one bad pull request must not end the run
+                        if not args.quiet:
+                            print(f"    {repo['name']} PR {pr_id}: {exc}", file=sys.stderr)
                         continue
                     if not ado_order:
                         continue
 
-                    files = numstat(repo_dir, base, head) if (repo_dir and base and head) else None
                     entries[str(pr_id)] = {
                         "pr": pr_id,
                         "status": pr.get("status", "completed"),
@@ -968,8 +1027,10 @@ def main(argv: Sequence[str]) -> int:
                     if within_window(entry, since)
                 )
 
-    finally:
-        pass
+    except KeyboardInterrupt:
+        print("\nInterrupted. Everything cached so far is kept; re-run to continue.",
+              file=sys.stderr)
+        return 130
 
     if not rows:
         print("No pull requests matched.", file=sys.stderr)
