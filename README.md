@@ -156,3 +156,80 @@ identifying strings that remain.
 - **Iteration timestamps are server-side push times**, which is what the debounce sees, but
   a retarget or a merge-conflict resolution creates an iteration without the author having
   pushed anything. The `by_reason` breakdown is there to size that.
+
+---
+
+# pr_diff_stats.py
+
+A second, independent tool in the same repository, sharing the same `AZDO_PAT` and the same
+read-only posture. Where `pr_push_stats.py` answers *how often people push*, this one answers
+*how big their pull requests are* — in changed lines and in estimated review tokens — so
+decisions about an AI reviewer's diff-size handling are made against real pull requests.
+
+## What it answers
+
+- How many files and how many changed lines a typical pull request carries, at p50 / p90 / p99.
+- How many of those lines are worth reviewing at all, with lockfiles, generated code, build
+  output and binaries excluded and counted separately.
+- What share of pull requests cross the reviewer's triage threshold, and what share would ever
+  need the diff split into chunks.
+- Whether large pull requests are large because of *many* files or a *few enormous* ones, which
+  decides whether summarising whole files helps or barely dents the problem.
+
+## Running it
+
+```bash
+export AZDO_PAT=...                    # PAT with Code (read) scope
+python3 pr_diff_stats.py \
+    --org https://dev.azure.com/contoso \
+    --all-projects \
+    --days 90 \
+    --with-line-stats \
+    --json pr-diff-stats.json
+```
+
+Python 3.10+ and the standard library. `--with-line-stats` also needs `git` on `PATH`.
+
+## The two modes
+
+| Mode | What you get | Cost |
+| --- | --- | --- |
+| default (REST only) | File counts, file types, size bands by file count | Fast, no clone, no disk |
+| `--with-line-stats` | Exact added/deleted lines per file, token estimates, all thresholds | A shallow bare clone per repository |
+
+Line counts need the clone. Azure DevOps REST exposes changed *files* and change types, but
+not changed *lines*, so anything claiming a line count without a clone is inferring it. The
+clone is `--bare --filter=blob:none`, credentials are passed through `http.extraheader` so the
+PAT never lands in a remote URL or the reflog, and the whole clone directory is deleted on exit
+unless you pass `--keep-clones DIR`.
+
+## What leaves your network
+
+Nothing, unless you choose to share the output. What the report contains is numbers, size
+bands and file extensions. It carries **no file paths, no repository or project names, no
+branch names, no author names, no commit messages and no code**. `--include-repo-names` adds a
+per-repository breakdown if you want one; it is off by default, so the default output is safe
+to hand to someone outside the organisation.
+
+## Useful flags
+
+| Flag | Effect |
+| --- | --- |
+| `--all-projects` | Scan every project instead of named ones. |
+| `--project NAME` | Repeatable, for a few projects but not all. |
+| `--days N` | How far back to look. Default 90. |
+| `--status active` | Repeatable. Default is `completed`. |
+| `--exclude-repo NAME` | Repeatable. Skip sandboxes, archives, forks. |
+| `--max-prs-per-repo N` | Sample cap per repository. Default 200. |
+| `--max-prs-total N` | Overall cap, so a large organisation cannot run away. Default 3000. |
+| `--keep-clones DIR` | Reuse clones across runs instead of a temporary directory. |
+| `--include-repo-names` | Add a per-repository breakdown. Off by default. |
+| `--triage-threshold-tokens N` | Compare against a different threshold. Default 25,000. |
+| `--json PATH` | Write the full report as JSON. This is the file worth sharing. |
+
+## Reading the token estimate
+
+Tokens are estimated, not counted: 45 characters per changed line, 4 characters per token, so
+roughly 11 tokens per changed line. That is deliberately the same crude arithmetic the reviewer
+budgets with, so the bands line up with what it would actually do. It is not a substitute for a
+real tokeniser, and it says so here rather than pretending otherwise.
