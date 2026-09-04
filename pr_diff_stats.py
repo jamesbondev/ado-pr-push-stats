@@ -7,9 +7,10 @@ the organisation's real pull requests rather than an intuition about them.
 
 Read-only. The only credential it wants is a PAT with `Code (read)`.
 
-Output is deliberately non-identifying by default: numbers, size bands and file
-extensions only. No file paths, no repository names, no branch names, no authors, no
-code. `--include-repo-names` opts out of that if you want per-repository breakdowns.
+Output carries no file paths, no branch names, no commit messages, no author or reviewer
+identity and no code: numbers, size bands, file extensions and repository names. Pass
+--anonymise-repos to replace the names with repo-1...repo-N before sharing outside the
+organisation that ran it. `--include-repo-names` opts out of that if you want per-repository breakdowns.
 
 Two modes:
 
@@ -36,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
@@ -61,11 +63,11 @@ MAX_DIFF_TOKEN_BUDGET = 250_000
 MAX_REVIEW_TOKENS = 500_000
 MAX_CHUNKS = 3
 
-# Argus estimates diff tokens at 4 characters per token. A changed line averages about
-# 45 characters including the diff's own +/- prefix, so ~11 tokens per changed line.
-# Crude by construction: it is the same crude number the reviewer itself budgets with.
-CHARS_PER_TOKEN = 4
-CHARS_PER_CHANGED_LINE = 45
+# Argus's own figure, from TokenEstimator.CharsPerToken, applied to the assembled diff.
+# Diff characters are measured rather than reconstructed from line counts, at the same three
+# lines of context Argus's UnifiedDiffGenerator emits, so the estimate is of the same text.
+CHARS_PER_TOKEN = 2.2
+DIFF_CONTEXT_LINES = 3
 
 # Files a reviewer should never spend tokens on. Counted separately rather than dropped,
 # because "this pull request is huge but 90% of it is a lockfile" is the finding.
@@ -79,6 +81,51 @@ GENERATED_PATTERNS = [
     r"(^|/)migrations?/", r"\.(dll|exe|so|dylib|jar|zip|gz|png|jpe?g|gif|ico|pdf|woff2?|ttf)$",
 ]
 GENERATED_RE = re.compile("|".join(GENERATED_PATTERNS), re.IGNORECASE)
+
+# Ported from Argus so the two agree on what "reviewable" means:
+# Argus.Application.Common.NonReviewableFiles and Argus.Engine.Classification.DiffFilter.
+# A file excluded here is one the reviewer fetches, spends its file-cap slot and its character
+# budget on, and then discards before a lens ever sees it.
+ARGUS_CONFIGURATION_EXT = {".json", ".yaml", ".yml", ".toml", ".properties", ".xml"}
+ARGUS_DOCUMENTATION_EXT = {".md", ".txt", ".rst", ".adoc", ".docx"}
+ARGUS_IMAGE_EXT = {".png", ".jpg", ".svg", ".gif", ".ico"}
+ARGUS_FONT_EXT = {".woff", ".ttf"}
+ARGUS_LOCKFILES = {
+    "package-lock.json", "packages.lock.json", "yarn.lock", "pnpm-lock.yaml",
+    "cargo.lock", "poetry.lock", "gemfile.lock", "go.sum", "composer.lock",
+}
+ARGUS_GENERATED_SUFFIX = (".designer.cs", ".g.cs", ".pyc")
+ARGUS_MINIFIED_SUFFIX = (".min.js", ".min.css")
+ARGUS_PATH_SEGMENTS = ("/migrations/", "/migration/", "/fixtures/", "/testdata/", "/test_data/")
+
+
+def argus_exclusion_reason(path: str) -> str | None:
+    """Why Argus would not review this file, or None when it would."""
+    lowered = path.lower()
+    name = lowered.rsplit("/", 1)[-1]
+    ext = "." + name.rsplit(".", 1)[-1] if "." in name else ""
+
+    if name in ARGUS_LOCKFILES:
+        return "lockfile"
+    if lowered.endswith(ARGUS_MINIFIED_SUFFIX):
+        return "minified"
+    if lowered.endswith(ARGUS_GENERATED_SUFFIX) or ".generated." in lowered:
+        return "generated"
+    if "__pycache__" in lowered:
+        return "generated"
+    if ext in ARGUS_CONFIGURATION_EXT:
+        return "configuration"
+    if ext in ARGUS_DOCUMENTATION_EXT:
+        return "documentation"
+    if ext in ARGUS_IMAGE_EXT:
+        return "image"
+    if ext in ARGUS_FONT_EXT:
+        return "font"
+    # Argus keeps EF model snapshots, which are the one migration file worth reading.
+    if any(seg in f"/{lowered}" for seg in ARGUS_PATH_SEGMENTS) and not name.endswith("modelsnapshot.cs"):
+        return "generated"
+    return None
+
 
 
 class AdoError(RuntimeError):
@@ -173,12 +220,21 @@ def list_repositories(client: AdoClient, project: str) -> list[dict[str, Any]]:
 
 def list_pull_requests(
     client: AdoClient, project: str, repo_id: str, since: datetime,
-    statuses: Sequence[str], page_size: int, max_prs: int,
-) -> list[dict[str, Any]]:
+    statuses: Sequence[str], page_size: int, max_prs: int | None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """
+    Every pull request created in the window, bounded server-side by minTime. Without that the
+    service returns the repository's whole history and the client pages until it sees something
+    old enough, which is what a per-repository quota was previously covering up.
+
+    The bool says the per-repository cap truncated the listing, so a short sample is visible in
+    the output rather than passing for a quiet repository.
+    """
     found: list[dict[str, Any]] = []
+    truncated = False
     for status in statuses:
         skip = 0
-        while len(found) < max_prs:
+        while max_prs is None or len(found) < max_prs:
             data = client.get(
                 f"{urllib.parse.quote(project)}/_apis/git/repositories/{repo_id}/pullrequests",
                 {
@@ -186,6 +242,7 @@ def list_pull_requests(
                     "$top": page_size,
                     "$skip": skip,
                     "searchCriteria.queryTimeRangeType": "created",
+                    "searchCriteria.minTime": since.isoformat(),
                 },
             )
             batch = data.get("value", [])
@@ -201,7 +258,11 @@ def list_pull_requests(
             if stop or len(batch) < page_size:
                 break
             skip += page_size
-    return found[:max_prs]
+
+        if max_prs is not None and len(found) >= max_prs:
+            truncated = True
+
+    return (found[:max_prs] if max_prs is not None else found), truncated
 
 
 def pr_file_changes(client: AdoClient, project: str, repo_id: str, pr_id: int) -> list[str]:
@@ -251,15 +312,26 @@ def clone_repo(remote_url: str, pat: str, dest: str, quiet: bool) -> bool:
     return result.returncode == 0
 
 
-def have_commits(repo_dir: str, shas: Sequence[str]) -> bool:
-    for sha in shas:
-        probe = subprocess.run(
-            ["git", "-C", repo_dir, "cat-file", "-e", f"{sha}^{{commit}}"],
-            capture_output=True, text=True,
-        )
-        if probe.returncode != 0:
-            return False
-    return True
+def commits_present(repo_dir: str, shas: Sequence[str]) -> set[str]:
+    """
+    Which of these exist locally as commits. One process for the whole repository: probing each
+    sha separately cost a process spawn per pull request, and spawn plus git's repository
+    discovery dominates the run on a large organisation.
+    """
+    unique = list(dict.fromkeys(shas))
+    if not unique:
+        return set()
+
+    probe = subprocess.run(
+        ["git", "-C", repo_dir, "cat-file", "--batch-check"],
+        input="\n".join(f"{sha}^{{commit}}" for sha in unique),
+        capture_output=True, text=True,
+    )
+    present: set[str] = set()
+    for sha, line in zip(unique, probe.stdout.splitlines()):
+        if " commit " in line:
+            present.add(sha)
+    return present
 
 
 def fetch_missing(repo_dir: str, pat: str, shas: Sequence[str]) -> None:
@@ -267,7 +339,8 @@ def fetch_missing(repo_dir: str, pat: str, shas: Sequence[str]) -> None:
     One fetch for every commit the clone is missing, rather than one per pull request. Commits on
     branches deleted after the merge are the usual absentees; the rest are already present.
     """
-    missing = [sha for sha in dict.fromkeys(shas) if not have_commits(repo_dir, [sha])]
+    present = commits_present(repo_dir, shas)
+    missing = [sha for sha in dict.fromkeys(shas) if sha not in present]
     if not missing:
         return
     subprocess.run(
@@ -276,27 +349,151 @@ def fetch_missing(repo_dir: str, pat: str, shas: Sequence[str]) -> None:
     )
 
 
-def numstat(repo_dir: str, base_sha: str, head_sha: str) -> list[tuple[int, int, str]] | None:
-    """(added, deleted, path) per file. None when either commit is missing from the clone."""
-    if not have_commits(repo_dir, [base_sha, head_sha]):
-        return None
+def numstat(repo_dir: str, base_sha: str, head_sha: str) -> list[list[Any]] | None:
+    """
+    (added, deleted, diff_chars, path, is_binary) per file, or None when a commit is unreachable.
+
+    One git invocation produces both the counts and the patch, so diff characters are measured at
+    the same context width the reviewer sees rather than reconstructed from a per-line average.
+    git fails cleanly on a missing object, so no separate existence probe is needed.
+    """
     result = subprocess.run(
-        ["git", "-C", repo_dir, "diff", "--numstat", f"{base_sha}...{head_sha}"],
-        capture_output=True, text=True,
+        ["git", "-C", repo_dir, "diff", "--numstat", "--patch",
+         f"-U{DIFF_CONTEXT_LINES}", f"{base_sha}...{head_sha}"],
+        capture_output=True, text=True, errors="replace",
     )
     if result.returncode != 0:
         return None
-    rows: list[tuple[int, int, str]] = []
-    for line in result.stdout.splitlines():
+
+    stdout = result.stdout
+    marker = "\ndiff --git "
+    split_at = stdout.find(marker)
+    numstat_block = stdout if split_at < 0 else stdout[:split_at]
+    patch_block = "" if split_at < 0 else stdout[split_at + 1:]
+
+    chars_by_path: dict[str, int] = {}
+    for section in patch_block.split("\ndiff --git "):
+        if not section:
+            continue
+        header = section.split("\n", 1)[0]
+        # "a/path b/path" — take the b-side, which is the path numstat reports for anything but
+        # a deletion, and fall back to the a-side for deletions.
+        parts = header.split(" b/", 1)
+        path = parts[1].strip() if len(parts) == 2 else header.removeprefix("a/").strip()
+        chars_by_path[path] = chars_by_path.get(path, 0) + len(section)
+
+    rows: list[list[Any]] = []
+    for line in numstat_block.splitlines():
         parts = line.split("\t")
         if len(parts) != 3:
             continue
         added, deleted, path = parts
-        # "-" marks a binary file; it has no line count, so it contributes files but no lines.
-        rows.append((0 if added == "-" else int(added),
-                     0 if deleted == "-" else int(deleted),
-                     path))
+        # "-" marks a binary file: no line count, and the patch carries no text either.
+        is_binary = added == "-"
+        rows.append([
+            0 if is_binary else int(added),
+            0 if is_binary else int(deleted),
+            chars_by_path.get(path, 0),
+            path,
+            is_binary,
+        ])
     return rows
+
+
+
+# --------------------------------------------------------------------------- #
+# Cache
+# --------------------------------------------------------------------------- #
+
+CACHE_FORMAT_VERSION = 1
+
+
+def repo_slug(project: str, repo_name: str) -> str:
+    """A filename that survives repository names containing characters Windows rejects."""
+    raw = f"{project}__{repo_name}"
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "-", raw)[:120]
+    digest = hashlib.sha1(raw.encode()).hexdigest()[:8]
+    return f"{safe}-{digest}"
+
+
+def write_json_atomically(path: str, payload: Any) -> None:
+    """Written to a temporary neighbour and renamed, so an interrupted run leaves no half file."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+    os.replace(tmp, path)
+
+
+class Cache:
+    """
+    Per-file rows for completed pull requests, one file per repository.
+
+    Raw rather than summarised, and free of any window: the questions this tool exists to answer
+    are all "what would a different rule have done to the same corpus", and only the rows can
+    answer those without another hours-long run. The window is applied when reporting.
+
+    A completed pull request's merge commits never move, so its rows are immutable and the entry
+    never expires. Entries whose commits the service has since collected are recorded as
+    unavailable, so a repository does not re-attempt them on every run forever.
+    """
+
+    def __init__(self, root: str) -> None:
+        self.root = root
+        self.manifest_path = os.path.join(root, "manifest.json")
+        self.manifest: dict[str, Any] = {"format_version": CACHE_FORMAT_VERSION, "repos": {}}
+        if os.path.isfile(self.manifest_path):
+            try:
+                loaded = json.load(open(self.manifest_path, encoding="utf-8"))
+                if loaded.get("format_version") == CACHE_FORMAT_VERSION:
+                    self.manifest = loaded
+            except (OSError, json.JSONDecodeError):
+                pass
+        self.hits = 0
+        self.misses = 0
+
+    def clone_dir(self, project: str, repo_name: str) -> str:
+        return os.path.join(self.root, "clones", f"{repo_slug(project, repo_name)}.git")
+
+    def _repo_path(self, project: str, repo_name: str) -> str:
+        return os.path.join(self.root, "repos", f"{repo_slug(project, repo_name)}.json")
+
+    def load_repo(self, project: str, repo_name: str) -> dict[str, dict[str, Any]]:
+        path = self._repo_path(project, repo_name)
+        if not os.path.isfile(path):
+            return {}
+        try:
+            return {str(e["pr"]): e for e in json.load(open(path, encoding="utf-8"))}
+        except (OSError, json.JSONDecodeError, KeyError, TypeError):
+            return {}
+
+    def save_repo(
+        self, project: str, repo_name: str, entries: dict[str, dict[str, Any]],
+        repo_id: str, truncated: bool,
+    ) -> None:
+        """Written as each repository finishes, so an interrupted run keeps what it has earned."""
+        write_json_atomically(self._repo_path(project, repo_name), list(entries.values()))
+        self.manifest["repos"][f"{project}/{repo_name}"] = {
+            "file": os.path.relpath(self._repo_path(project, repo_name), self.root),
+            "repo_id": repo_id,
+            "last_scanned_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "pull_requests": len(entries),
+            "unavailable": sum(1 for e in entries.values() if e.get("unavailable")),
+            "list_truncated": truncated,
+        }
+        write_json_atomically(self.manifest_path, self.manifest)
+
+    def is_usable(self, entry: dict[str, Any], base: str | None, head: str | None,
+                  retry_unavailable: bool) -> bool:
+        if entry.get("status") != "completed":
+            return False
+        if entry.get("unavailable"):
+            return not retry_unavailable
+        if base and entry.get("base") != base:
+            return False
+        if head and entry.get("head") != head:
+            return False
+        return entry.get("files") is not None
 
 
 def extension_of(path: str) -> str:
@@ -306,8 +503,8 @@ def extension_of(path: str) -> str:
     return "." + name.rsplit(".", 1)[-1].lower()[:12]
 
 
-def estimate_tokens(changed_lines: int) -> int:
-    return int(changed_lines * CHARS_PER_CHANGED_LINE / CHARS_PER_TOKEN)
+def estimate_tokens(diff_chars: int) -> int:
+    return int(diff_chars / CHARS_PER_TOKEN)
 
 
 def percentile(values: Sequence[float], fraction: float) -> float | None:
@@ -379,7 +576,7 @@ def build_report(rows: list[dict[str, Any]], config: dict[str, Any]) -> dict[str
     if have_lines:
         changed = [r["changed_lines"] for r in have_lines]
         reviewable = [r["reviewable_lines"] for r in have_lines]
-        tokens = [estimate_tokens(r["reviewable_lines"]) for r in have_lines]
+        tokens = [estimate_tokens(r["reviewable_chars"] or 0) for r in have_lines]
         generated_share = [
             round(100.0 * (r["changed_lines"] - r["reviewable_lines"]) / r["changed_lines"], 1)
             for r in have_lines if r["changed_lines"] > 0
@@ -406,7 +603,7 @@ def build_report(rows: list[dict[str, Any]], config: dict[str, Any]) -> dict[str
         }
         # Is a big pull request big because of many files, or a few enormous ones? Summarising
         # whole files helps the first shape and barely dents the second.
-        big = [r for r in have_lines if estimate_tokens(r["reviewable_lines"]) >= threshold]
+        big = [r for r in have_lines if estimate_tokens(r["reviewable_chars"] or 0) >= threshold]
         if big:
             report["shape_of_large_prs"] = {
                 "count": len(big),
@@ -430,19 +627,46 @@ def build_report(rows: list[dict[str, Any]], config: dict[str, Any]) -> dict[str
     if ext_lines:
         report["top_extensions_by_changed_lines"] = dict(ext_lines.most_common(30))
 
-    if config.get("include_repo_names"):
-        per_repo: dict[str, list[dict[str, Any]]] = {}
-        for row in rows:
-            per_repo.setdefault(row["repo"], []).append(row)
-        report["per_repository"] = {
-            name: {
-                "pull_requests": len(items),
-                "files_per_pr": summarise([i["files"] for i in items]),
-                "changed_lines_per_pr": summarise(
-                    [i["changed_lines"] for i in items if i.get("changed_lines") is not None]),
-            }
-            for name, items in sorted(per_repo.items())
+    # Always broken down per repository, because "which repositories drive which file types" is the
+    # question the totals raise and cannot answer: a documentation repository and a service whose
+    # pipelines churn look identical in an organisation-wide extension tally.
+    per_repo: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        per_repo.setdefault(row["repo"], []).append(row)
+
+    named = not config.get("anonymise_repos")
+    ordered = sorted(per_repo.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+    report["per_repository"] = {}
+
+    for index, (name, items) in enumerate(ordered, start=1):
+        label = name if named else f"repo-{index}"
+        extensions: Counter[str] = Counter()
+        ext_lines: Counter[str] = Counter()
+        for item in items:
+            extensions.update(item.get("extensions", {}))
+            ext_lines.update(item.get("extension_lines", {}))
+
+        with_lines = [i for i in items if i.get("changed_lines") is not None]
+        entry: dict[str, Any] = {
+            "pull_requests": len(items),
+            "files_per_pr": summarise([i["files"] for i in items]),
+            "changed_lines_per_pr": summarise([i["changed_lines"] for i in with_lines]),
+            "reviewable_lines_per_pr": summarise([i["reviewable_lines"] for i in with_lines]),
+            "top_extensions_by_file_count": dict(extensions.most_common(15)),
         }
+        if ext_lines:
+            entry["top_extensions_by_changed_lines"] = dict(ext_lines.most_common(15))
+            total_lines = sum(ext_lines.values())
+            if total_lines > 0:
+                # The share a single extension takes of a repository's whole change volume. A
+                # repository that is 95% one type is a different proposition from one that is mixed,
+                # and only this ratio separates them.
+                dominant_ext, dominant_lines = ext_lines.most_common(1)[0]
+                entry["dominant_extension"] = dominant_ext
+                entry["dominant_extension_share_percent"] = round(
+                    100.0 * dominant_lines / total_lines, 1)
+
+        report["per_repository"][label] = entry
 
     return report
 
@@ -506,6 +730,20 @@ def render(report: dict[str, Any]) -> str:
                 f"   p90 {shape['largest_file_share_percent']['p90']:.0f}%")
         add("")
 
+    per_repo = report.get("per_repository") or {}
+    dominated = [
+        (label, entry["dominant_extension"], entry["dominant_extension_share_percent"],
+         entry["pull_requests"])
+        for label, entry in per_repo.items()
+        if entry.get("dominant_extension_share_percent", 0) >= 60
+    ]
+    if dominated:
+        add("Repositories dominated by one file type")
+        add("  A repository that is almost entirely one type may not want reviewing at all.")
+        for label, ext, share, prs in sorted(dominated, key=lambda d: -d[3])[:10]:
+            add(f"  {label:>12}  {ext:>10}  {share:>5.0f}% of changed lines  ({prs:,} pull requests)")
+        add("")
+
     exts = report.get("top_extensions_by_changed_lines") or report.get("top_extensions_by_file_count")
     if exts:
         add("Most-changed file types")
@@ -526,20 +764,85 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--status", action="append", default=[],
                         help="Repeatable. Default: completed.")
     parser.add_argument("--exclude-repo", action="append", default=[])
-    parser.add_argument("--max-prs-per-repo", type=int, default=200)
-    parser.add_argument("--max-prs-total", type=int, default=3000)
+    # No total quota: it bounded the sample rather than the run, and did it by abandoning whole
+    # repositories once the count was met. --days is the bound that means something.
+    parser.add_argument("--max-prs-per-repo", type=int, default=None,
+                        help="Sample cap per repository. Unlimited by default; when it binds, "
+                             "the repository is marked list_truncated in the cache manifest.")
     parser.add_argument("--page-size", type=int, default=100)
-    parser.add_argument("--with-line-stats", action="store_true",
-                        help="Clone each repository to get exact added/deleted line counts.")
-    parser.add_argument("--keep-clones", metavar="DIR",
-                        help="Reuse and keep clones in DIR instead of a temporary directory.")
-    parser.add_argument("--include-repo-names", action="store_true",
-                        help="Include a per-repository breakdown. Off by default.")
+    parser.add_argument("--cache", metavar="DIR", default="cache",
+                        help="Per-repository cache and clones. Kept between runs, so a later run "
+                             "only fetches pull requests created since the last scan.")
+    parser.add_argument("--no-fetch", action="store_true",
+                        help="Report from the cache alone. No clone, no git, no diff fetch.")
+    parser.add_argument("--retry-unavailable", action="store_true",
+                        help="Retry pull requests whose merge commits were unreachable.")
+    parser.add_argument("--anonymise-repos", action="store_true",
+                        help="Replace repository names with repo-1...repo-N in the output.")
     parser.add_argument("--triage-threshold-tokens", type=int, default=TRIAGE_THRESHOLD_TOKENS)
     parser.add_argument("--max-diff-token-budget", type=int, default=MAX_DIFF_TOKEN_BUDGET)
     parser.add_argument("--json", metavar="PATH", help="Write the full report as JSON.")
     parser.add_argument("--quiet", action="store_true")
     return parser.parse_args(argv)
+
+
+def within_window(entry: dict[str, Any], since: datetime) -> bool:
+    created = parse_time(entry.get("created_utc"))
+    return created is None or created >= since
+
+
+def build_row(repo: str, entry: dict[str, Any]) -> dict[str, Any]:
+    """
+    One pull request's metrics, derived from cached rows. Everything here is arithmetic, so a
+    changed rule set is re-scored without touching the network or git.
+    """
+    ado_order: list[str] = entry.get("ado_order") or []
+    files: list[list[Any]] | None = entry.get("files")
+
+    row: dict[str, Any] = {
+        "repo": repo,
+        "files": len(ado_order),
+        "reviewable_files": sum(1 for p in ado_order if argus_exclusion_reason(p) is None),
+        "extensions": dict(Counter(
+            extension_of(p) for p in ado_order if argus_exclusion_reason(p) is None)),
+        "changed_lines": None,
+        "reviewable_lines": None,
+        "largest_file_lines": None,
+        "extension_lines": {},
+        "reviewable_chars": None,
+        "excluded_chars": None,
+        "binary_files": None,
+    }
+
+    if not files:
+        return row
+
+    ext_lines: Counter[str] = Counter()
+    changed = reviewable = largest = reviewable_chars = excluded_chars = binaries = 0
+
+    for added, deleted, chars, path, is_binary in files:
+        lines = added + deleted
+        changed += lines
+        if is_binary:
+            binaries += 1
+        if argus_exclusion_reason(path) is None:
+            reviewable += lines
+            reviewable_chars += chars
+            largest = max(largest, lines)
+            # Accumulated rather than built as a dict comprehension: duplicate keys in one of
+            # those overwrite, so every extension reported only its last file in the pull request.
+            ext_lines[extension_of(path)] += lines
+        else:
+            excluded_chars += chars
+
+    row["changed_lines"] = changed
+    row["reviewable_lines"] = reviewable
+    row["largest_file_lines"] = largest
+    row["extension_lines"] = dict(ext_lines)
+    row["reviewable_chars"] = reviewable_chars
+    row["excluded_chars"] = excluded_chars
+    row["binary_files"] = binaries
+    return row
 
 
 def main(argv: Sequence[str]) -> int:
@@ -548,8 +851,8 @@ def main(argv: Sequence[str]) -> int:
     if not pat:
         print("AZDO_PAT is not set. Use a PAT with Code (read) scope.", file=sys.stderr)
         return 2
-    if args.with_line_stats and not shutil.which("git"):
-        print("--with-line-stats needs git on PATH.", file=sys.stderr)
+    if not args.no_fetch and not shutil.which("git"):
+        print("git is needed on PATH unless --no-fetch is passed.", file=sys.stderr)
         return 2
 
     client = AdoClient(args.org, pat)
@@ -566,8 +869,7 @@ def main(argv: Sequence[str]) -> int:
         return 2
 
     excluded = {name.lower() for name in args.exclude_repo}
-    clone_root = args.keep_clones or tempfile.mkdtemp(prefix="pr-diff-stats-")
-    os.makedirs(clone_root, exist_ok=True)
+    cache = Cache(args.cache)
     rows: list[dict[str, Any]] = []
 
     try:
@@ -580,13 +882,12 @@ def main(argv: Sequence[str]) -> int:
                 continue
 
             for repo in repos:
-                if len(rows) >= args.max_prs_total:
-                    break
                 if repo["name"].lower() in excluded:
                     continue
                 try:
-                    prs = list_pull_requests(client, project, repo["id"], since, statuses,
-                                             args.page_size, args.max_prs_per_repo)
+                    prs, listing_truncated = list_pull_requests(
+                        client, project, repo["id"], since, statuses,
+                        args.page_size, args.max_prs_per_repo)
                 except AdoError as exc:
                     if not args.quiet:
                         print(f"  {project}/{repo['name']}: {exc}", file=sys.stderr)
@@ -594,11 +895,24 @@ def main(argv: Sequence[str]) -> int:
                 if not prs:
                     continue
                 if not args.quiet:
-                    print(f"  {project}/{repo['name']}: {len(prs)} pull requests", file=sys.stderr)
+                    print(f"  {project}/{repo['name']}: {len(prs)} pull requests",
+                          file=sys.stderr, flush=True)
+
+                entries = cache.load_repo(project, repo["name"])
+                pending = [
+                    pr for pr in prs
+                    if not cache.is_usable(
+                        entries.get(str(pr["pullRequestId"]), {}),
+                        (pr.get("lastMergeTargetCommit") or {}).get("commitId"),
+                        (pr.get("lastMergeSourceCommit") or {}).get("commitId"),
+                        args.retry_unavailable)
+                ]
+                cache.hits += len(prs) - len(pending)
+                cache.misses += len(pending)
 
                 repo_dir = None
-                if args.with_line_stats:
-                    repo_dir = os.path.join(clone_root, f"{project}__{repo['name']}.git")
+                if pending and not args.no_fetch:
+                    repo_dir = cache.clone_dir(project, repo["name"])
                     if not os.path.isdir(repo_dir):
                         if not args.quiet:
                             print(f"    cloning {repo['name']}...", file=sys.stderr, flush=True)
@@ -607,56 +921,55 @@ def main(argv: Sequence[str]) -> int:
 
                     if repo_dir:
                         # One fetch for the whole repository rather than one per pull request.
-                        wanted = [
+                        fetch_missing(repo_dir, pat, [
                             sha
-                            for pr in prs
+                            for pr in pending
                             for sha in (
                                 (pr.get("lastMergeTargetCommit") or {}).get("commitId"),
                                 (pr.get("lastMergeSourceCommit") or {}).get("commitId"),
                             )
                             if sha
-                        ]
-                        fetch_missing(repo_dir, pat, wanted)
+                        ])
 
-                for index, pr in enumerate(prs, start=1):
-                    if len(rows) >= args.max_prs_total:
-                        break
+                for index, pr in enumerate(pending, start=1):
                     if not args.quiet and index % 25 == 0:
-                        print(f"    {repo['name']}: {index}/{len(prs)}", file=sys.stderr, flush=True)
+                        print(f"    {repo['name']}: {index}/{len(pending)} new",
+                              file=sys.stderr, flush=True)
+
+                    pr_id = pr["pullRequestId"]
+                    base = (pr.get("lastMergeTargetCommit") or {}).get("commitId")
+                    head = (pr.get("lastMergeSourceCommit") or {}).get("commitId")
+
                     try:
-                        paths = pr_file_changes(client, project, repo["id"], pr["pullRequestId"])
+                        ado_order = pr_file_changes(client, project, repo["id"], pr_id)
                     except AdoError:
                         continue
-                    if not paths:
+                    if not ado_order:
                         continue
 
-                    reviewable_paths = [p for p in paths if not GENERATED_RE.search(p)]
-                    row: dict[str, Any] = {
-                        "repo": f"{project}/{repo['name']}",
-                        "files": len(paths),
-                        "reviewable_files": len(reviewable_paths),
-                        "extensions": dict(Counter(extension_of(p) for p in reviewable_paths)),
-                        "changed_lines": None,
-                        "reviewable_lines": None,
-                        "largest_file_lines": None,
-                        "extension_lines": {},
+                    files = numstat(repo_dir, base, head) if (repo_dir and base and head) else None
+                    entries[str(pr_id)] = {
+                        "pr": pr_id,
+                        "status": pr.get("status", "completed"),
+                        "created_utc": pr.get("creationDate"),
+                        "base": base,
+                        "head": head,
+                        "ado_order": ado_order,
+                        "files": files,
+                        # Recorded rather than retried forever: once the service has collected the
+                        # merge commits of a deleted branch, no later run can recover them.
+                        "unavailable": None if files is not None else "commits_unreachable",
                     }
 
-                    if repo_dir:
-                        base = (pr.get("lastMergeTargetCommit") or {}).get("commitId")
-                        head = (pr.get("lastMergeSourceCommit") or {}).get("commitId")
-                        stats = numstat(repo_dir, base, head) if base and head else None
-                        if stats:
-                            row["changed_lines"] = sum(a + d for a, d, _ in stats)
-                            keep = [(a, d, p) for a, d, p in stats if not GENERATED_RE.search(p)]
-                            row["reviewable_lines"] = sum(a + d for a, d, _ in keep)
-                            row["largest_file_lines"] = max((a + d for a, d, _ in keep), default=0)
-                            row["extension_lines"] = dict(
-                                Counter({extension_of(p): a + d for a, d, p in keep}))
-                    rows.append(row)
+                cache.save_repo(project, repo["name"], entries, repo["id"], listing_truncated)
+                rows.extend(
+                    build_row(f"{project}/{repo['name']}", entry)
+                    for entry in entries.values()
+                    if within_window(entry, since)
+                )
+
     finally:
-        if not args.keep_clones:
-            shutil.rmtree(clone_root, ignore_errors=True)
+        pass
 
     if not rows:
         print("No pull requests matched.", file=sys.stderr)
@@ -666,15 +979,17 @@ def main(argv: Sequence[str]) -> int:
         "days": args.days,
         "statuses": statuses,
         "projects_scanned": len(projects),
-        "line_stats": bool(args.with_line_stats),
-        "include_repo_names": bool(args.include_repo_names),
+        "line_stats": True,
+        "anonymise_repos": bool(args.anonymise_repos),
+        "cache_hits": cache.hits,
+        "cache_misses": cache.misses,
+        "chars_per_token": CHARS_PER_TOKEN,
         "triage_threshold_tokens": args.triage_threshold_tokens,
         "max_diff_token_budget": args.max_diff_token_budget,
-        "chars_per_changed_line": CHARS_PER_CHANGED_LINE,
         "chars_per_token": CHARS_PER_TOKEN,
     }
     report = build_report(rows, config)
-    if args.with_line_stats and report["pull_requests"]["with_line_counts"] == 0:
+    if not args.no_fetch and report["pull_requests"]["with_line_counts"] == 0:
         print(
             "Line counts were requested but none were produced: every clone or commit lookup "
             "failed. Check that the PAT has Code (read) on these repositories.",

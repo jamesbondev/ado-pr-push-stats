@@ -190,27 +190,30 @@ python3 pr_diff_stats.py \
 
 Python 3.10+ and the standard library. `--with-line-stats` also needs `git` on `PATH`.
 
-## The two modes
+## The cache
 
-| Mode | What you get | Cost |
-| --- | --- | --- |
-| default (REST only) | File counts, file types, size bands by file count | Fast, no clone, no disk |
-| `--with-line-stats` | Exact added/deleted lines per file, token estimates, all thresholds | A shallow bare clone per repository |
+Line counts need a clone and a `git diff` per pull request, so a first run over a large
+organisation takes a long time. Everything after that is arithmetic, so the expensive part is
+cached and never repeated.
 
-Line counts need the clone. Azure DevOps REST exposes changed *files* and change types, but
-not changed *lines*, so anything claiming a line count without a clone is inferring it. The
-clone is a full `--bare` one: `git diff` needs file contents, and a blobless clone fetches them
-lazily one round trip at a time, so paying once up front is far cheaper across a repository's
-history. Commits missing from the clone, usually branches deleted after the merge, are fetched
-once per repository rather than once per pull request. Credentials go through `http.extraheader`
-on each git invocation, so the PAT never lands in a remote URL, the reflog or the clone's config,
-and the whole clone directory is deleted on exit unless you pass `--keep-clones DIR`.
+`--cache DIR` (default `cache/`) holds one JSON file per repository plus the bare clones. Each
+entry is a completed pull request's per-file rows: added, deleted, diff characters, path, and
+whether the file is binary, alongside the order Azure DevOps listed the files in. A completed
+pull request's merge commits never move, so an entry is immutable and never expires.
 
-On a large organisation the clones dominate the run. `--keep-clones DIR` makes a second run reuse
-them, and `--max-prs-per-repo` bounds the sample. If the report says `With exact line counts: 0`,
-the clones or commit lookups all failed and the PAT probably lacks `Code (read)`.
+Consequences worth knowing:
 
-## What leaves your network
+- **A re-run as the window slides is cheap.** The window is applied when reporting, not when
+  caching, so moving from one 90-day period to the next only fetches what is new.
+- **`--no-fetch` reports from the cache alone**, with no network and no git. Re-scoring the corpus
+  against a different exclusion rule takes seconds.
+- **Each repository is written as it finishes**, so an interrupted run keeps what it earned.
+- **Pull requests whose merge commits the service has collected are recorded as unavailable**
+  rather than retried forever. `--retry-unavailable` overrides that.
+- **The cache holds file paths**, which are more revealing than anything the report emits. It is a
+  local working file; the `--json` report is the shareable artefact. Add `cache/` to `.gitignore`.
+
+## What leaves your network## What leaves your network
 
 Nothing, unless you choose to share the output. What the report contains is numbers, size
 bands and file extensions. It carries **no file paths, no repository or project names, no
@@ -227,16 +230,17 @@ to hand to someone outside the organisation.
 | `--days N` | How far back to look. Default 90. |
 | `--status active` | Repeatable. Default is `completed`. |
 | `--exclude-repo NAME` | Repeatable. Skip sandboxes, archives, forks. |
-| `--max-prs-per-repo N` | Sample cap per repository. Default 200. |
-| `--max-prs-total N` | Overall cap, so a large organisation cannot run away. Default 3000. |
-| `--keep-clones DIR` | Reuse clones across runs instead of a temporary directory. |
-| `--include-repo-names` | Add a per-repository breakdown. Off by default. |
+| `--max-prs-per-repo N` | Sample cap per repository. Unlimited by default; a repository it truncates is marked `list_truncated` in the manifest. |
+| `--cache DIR` | Cache and clones. Default `cache/`. |
+| `--no-fetch` | Report from the cache alone. |
+| `--retry-unavailable` | Retry pull requests whose merge commits were unreachable. |
+| `--anonymise-repos` | Replace repository names with `repo-1`...`repo-N`. |
 | `--triage-threshold-tokens N` | Compare against a different threshold. Default 25,000. |
 | `--json PATH` | Write the full report as JSON. This is the file worth sharing. |
 
 ## Reading the token estimate
 
-Tokens are estimated, not counted: 45 characters per changed line, 4 characters per token, so
-roughly 11 tokens per changed line. That is deliberately the same crude arithmetic the reviewer
-budgets with, so the bands line up with what it would actually do. It is not a substitute for a
-real tokeniser, and it says so here rather than pretending otherwise.
+Diff characters are measured, at the same three lines of context the reviewer's own diff carries,
+and divided by 2.2 — the constant in the reviewer's `TokenEstimator`. So the figure is an estimate
+of the same text by the same arithmetic, rather than a reconstruction from a per-line average. It
+is still not a tokeniser, and a file the reviewer excludes contributes nothing.
