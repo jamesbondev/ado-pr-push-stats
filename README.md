@@ -184,11 +184,11 @@ python3 pr_diff_stats.py \
     --org https://dev.azure.com/contoso \
     --all-projects \
     --days 90 \
-    --with-line-stats \
     --json pr-diff-stats.json
 ```
 
-Python 3.10+ and the standard library. `--with-line-stats` also needs `git` on `PATH`.
+Python 3.10+, the standard library, and `git` on `PATH`. The run is resumable: if it stops, the
+same command continues from the cache.
 
 ## The cache
 

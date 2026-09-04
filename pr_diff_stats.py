@@ -12,13 +12,10 @@ identity and no code: numbers, size bands, file extensions and repository names.
 --anonymise-repos to replace the names with repo-1...repo-N before sharing outside the
 organisation that ran it. `--include-repo-names` opts out of that if you want per-repository breakdowns.
 
-Two modes:
-
-  REST only (default)      File counts per pull request. Fast, no clone, no disk.
-  --with-line-stats        Adds exact added/deleted line counts via `git diff --numstat`
-                           against a shallow clone per repository. Slower, needs git and
-                           temporary disk, and is the only way to get line counts:
-                           Azure DevOps REST does not expose them.
+Line counts need a clone: Azure DevOps REST exposes changed files and change types but not
+changed lines. The clone and every pull request's measurements are cached under --cache, so the
+cost is paid once and a later run only fetches what is new. A run is resumable; if it stops, the
+same command continues from where it left off.
 
 Example:
 
@@ -27,10 +24,9 @@ Example:
         --org https://dev.azure.com/contoso \
         --all-projects \
         --days 90 \
-        --with-line-stats \
         --json pr-diff-stats.json
 
-Then hand over `pr-diff-stats.json`.
+Then hand over `pr-diff-stats.json`. Re-report from the cache alone with --no-fetch.
 """
 
 from __future__ import annotations
