@@ -199,9 +199,16 @@ Python 3.10+ and the standard library. `--with-line-stats` also needs `git` on `
 
 Line counts need the clone. Azure DevOps REST exposes changed *files* and change types, but
 not changed *lines*, so anything claiming a line count without a clone is inferring it. The
-clone is `--bare --filter=blob:none`, credentials are passed through `http.extraheader` so the
-PAT never lands in a remote URL or the reflog, and the whole clone directory is deleted on exit
-unless you pass `--keep-clones DIR`.
+clone is a full `--bare` one: `git diff` needs file contents, and a blobless clone fetches them
+lazily one round trip at a time, so paying once up front is far cheaper across a repository's
+history. Commits missing from the clone, usually branches deleted after the merge, are fetched
+once per repository rather than once per pull request. Credentials go through `http.extraheader`
+on each git invocation, so the PAT never lands in a remote URL, the reflog or the clone's config,
+and the whole clone directory is deleted on exit unless you pass `--keep-clones DIR`.
+
+On a large organisation the clones dominate the run. `--keep-clones DIR` makes a second run reuse
+them, and `--max-prs-per-repo` bounds the sample. If the report says `With exact line counts: 0`,
+the clones or commit lookups all failed and the PAT probably lacks `Code (read)`.
 
 ## What leaves your network
 

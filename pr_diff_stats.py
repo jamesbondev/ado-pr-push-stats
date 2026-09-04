@@ -228,26 +228,57 @@ def pr_file_changes(client: AdoClient, project: str, repo_id: str, pr_id: int) -
     return paths
 
 
-def clone_repo(remote_url: str, pat: str, dest: str, quiet: bool) -> bool:
-    """Bare clone, credentials passed via header so the PAT never lands in a URL or reflog."""
+def auth_args(pat: str) -> list[str]:
+    """
+    Credentials for one git invocation. Passed per command rather than written into the clone's
+    config: a PAT in a repository's config outlives the run and ends up in whatever the directory
+    is later copied into.
+    """
     header = base64.b64encode(f":{pat}".encode()).decode()
-    cmd = [
-        "git", "-c", f"http.extraheader=Authorization: Basic {header}",
-        "clone", "--bare", "--filter=blob:none", "--quiet", remote_url, dest,
-    ]
+    return ["-c", f"http.extraheader=Authorization: Basic {header}"]
+
+
+def clone_repo(remote_url: str, pat: str, dest: str, quiet: bool) -> bool:
+    """
+    Full bare clone. Deliberately not --filter=blob:none: git diff needs file contents, and a
+    blobless clone fetches them lazily one round trip at a time, so a twenty-file pull request
+    costs forty network calls. Paying once up front is far cheaper across a repository's history.
+    """
+    cmd = ["git", *auth_args(pat), "clone", "--bare", "--quiet", remote_url, dest]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0 and not quiet:
         print(f"    clone failed: {result.stderr.strip()[:160]}", file=sys.stderr)
     return result.returncode == 0
 
 
-def numstat(repo_dir: str, base_sha: str, head_sha: str) -> list[tuple[int, int, str]] | None:
-    """(added, deleted, path) per file. None when either commit is missing from the clone."""
-    fetch = subprocess.run(
-        ["git", "-C", repo_dir, "fetch", "--quiet", "origin", base_sha, head_sha],
+def have_commits(repo_dir: str, shas: Sequence[str]) -> bool:
+    for sha in shas:
+        probe = subprocess.run(
+            ["git", "-C", repo_dir, "cat-file", "-e", f"{sha}^{{commit}}"],
+            capture_output=True, text=True,
+        )
+        if probe.returncode != 0:
+            return False
+    return True
+
+
+def fetch_missing(repo_dir: str, pat: str, shas: Sequence[str]) -> None:
+    """
+    One fetch for every commit the clone is missing, rather than one per pull request. Commits on
+    branches deleted after the merge are the usual absentees; the rest are already present.
+    """
+    missing = [sha for sha in dict.fromkeys(shas) if not have_commits(repo_dir, [sha])]
+    if not missing:
+        return
+    subprocess.run(
+        ["git", "-C", repo_dir, *auth_args(pat), "fetch", "--quiet", "origin", *missing],
         capture_output=True, text=True,
     )
-    if fetch.returncode != 0:
+
+
+def numstat(repo_dir: str, base_sha: str, head_sha: str) -> list[tuple[int, int, str]] | None:
+    """(added, deleted, path) per file. None when either commit is missing from the clone."""
+    if not have_commits(repo_dir, [base_sha, head_sha]):
         return None
     result = subprocess.run(
         ["git", "-C", repo_dir, "diff", "--numstat", f"{base_sha}...{head_sha}"],
@@ -569,12 +600,29 @@ def main(argv: Sequence[str]) -> int:
                 if args.with_line_stats:
                     repo_dir = os.path.join(clone_root, f"{project}__{repo['name']}.git")
                     if not os.path.isdir(repo_dir):
+                        if not args.quiet:
+                            print(f"    cloning {repo['name']}...", file=sys.stderr, flush=True)
                         if not clone_repo(repo["remoteUrl"], pat, repo_dir, args.quiet):
                             repo_dir = None
 
-                for pr in prs:
+                    if repo_dir:
+                        # One fetch for the whole repository rather than one per pull request.
+                        wanted = [
+                            sha
+                            for pr in prs
+                            for sha in (
+                                (pr.get("lastMergeTargetCommit") or {}).get("commitId"),
+                                (pr.get("lastMergeSourceCommit") or {}).get("commitId"),
+                            )
+                            if sha
+                        ]
+                        fetch_missing(repo_dir, pat, wanted)
+
+                for index, pr in enumerate(prs, start=1):
                     if len(rows) >= args.max_prs_total:
                         break
+                    if not args.quiet and index % 25 == 0:
+                        print(f"    {repo['name']}: {index}/{len(prs)}", file=sys.stderr, flush=True)
                     try:
                         paths = pr_file_changes(client, project, repo["id"], pr["pullRequestId"])
                     except AdoError:
@@ -626,6 +674,12 @@ def main(argv: Sequence[str]) -> int:
         "chars_per_token": CHARS_PER_TOKEN,
     }
     report = build_report(rows, config)
+    if args.with_line_stats and report["pull_requests"]["with_line_counts"] == 0:
+        print(
+            "Line counts were requested but none were produced: every clone or commit lookup "
+            "failed. Check that the PAT has Code (read) on these repositories.",
+            file=sys.stderr,
+        )
     print(render(report))
     if args.json:
         with open(args.json, "w", encoding="utf-8") as handle:
