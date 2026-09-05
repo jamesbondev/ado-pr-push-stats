@@ -94,6 +94,21 @@ ARGUS_GENERATED_SUFFIX = (".designer.cs", ".g.cs", ".pyc")
 ARGUS_MINIFIED_SUFFIX = (".min.js", ".min.css")
 ARGUS_PATH_SEGMENTS = ("/migrations/", "/migration/", "/fixtures/", "/testdata/", "/test_data/")
 
+# Extensions --exclude-ext adds on top of the ported rules, so a candidate exclusion can be
+# scored against the cache before anyone changes Argus itself. Empty means "score Argus as it
+# ships today".
+EXTRA_EXCLUDED_EXT: set[str] = set()
+
+
+def normalise_extensions(values: Sequence[str]) -> set[str]:
+    out: set[str] = set()
+    for value in values:
+        for part in value.split(","):
+            part = part.strip().lower()
+            if part:
+                out.add(part if part.startswith(".") else f".{part}")
+    return out
+
 
 def argus_exclusion_reason(path: str) -> str | None:
     """Why Argus would not review this file, or None when it would."""
@@ -109,6 +124,8 @@ def argus_exclusion_reason(path: str) -> str | None:
         return "generated"
     if "__pycache__" in lowered:
         return "generated"
+    if ext in EXTRA_EXCLUDED_EXT:
+        return "excluded by --exclude-ext"
     if ext in ARGUS_CONFIGURATION_EXT:
         return "configuration"
     if ext in ARGUS_DOCUMENTATION_EXT:
@@ -706,6 +723,9 @@ def render(report: dict[str, Any]) -> str:
     prs = report["pull_requests"]
     add(f"Pull requests sampled : {prs['total']:,}")
     add(f"With exact line counts: {prs['with_line_counts']:,}")
+    extra = report.get("config", {}).get("extra_excluded_extensions") or []
+    if extra:
+        add(f"Also excluded (scenario): {', '.join(extra)}")
     add("")
 
     def table(title: str, stats: dict[str, Any], unit: str = "") -> None:
@@ -806,6 +826,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
                         help="Retry pull requests whose merge commits were unreachable.")
     parser.add_argument("--anonymise-repos", action="store_true",
                         help="Replace repository names with repo-1...repo-N in the output.")
+    parser.add_argument("--exclude-ext", action="append", default=[],
+                        metavar=".csv,.tsv",
+                        help="Score as if Argus also excluded these extensions. Repeatable, "
+                             "and comma-separated values are accepted. Re-scores from cache, "
+                             "so pair it with --no-fetch.")
     parser.add_argument("--triage-threshold-tokens", type=int, default=TRIAGE_THRESHOLD_TOKENS)
     parser.add_argument("--max-diff-token-budget", type=int, default=MAX_DIFF_TOKEN_BUDGET)
     parser.add_argument("--json", metavar="PATH", help="Write the full report as JSON.")
@@ -881,6 +906,8 @@ def main(argv: Sequence[str]) -> int:
     if not args.no_fetch and not shutil.which("git"):
         print("git is needed on PATH unless --no-fetch is passed.", file=sys.stderr)
         return 2
+
+    EXTRA_EXCLUDED_EXT.update(normalise_extensions(args.exclude_ext))
 
     client = AdoClient(args.org, pat)
     since = datetime.now(timezone.utc) - timedelta(days=args.days)
@@ -1043,7 +1070,7 @@ def main(argv: Sequence[str]) -> int:
         "chars_per_token": CHARS_PER_TOKEN,
         "triage_threshold_tokens": args.triage_threshold_tokens,
         "max_diff_token_budget": args.max_diff_token_budget,
-        "chars_per_token": CHARS_PER_TOKEN,
+        "extra_excluded_extensions": sorted(EXTRA_EXCLUDED_EXT),
     }
     report = build_report(rows, config)
     if not args.no_fetch and report["pull_requests"]["with_line_counts"] == 0:
