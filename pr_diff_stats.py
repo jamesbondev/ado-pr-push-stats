@@ -664,12 +664,19 @@ def build_report(rows: list[dict[str, Any]], config: dict[str, Any]) -> dict[str
 
     extensions: Counter[str] = Counter()
     ext_lines: Counter[str] = Counter()
+    skipped_ext_lines: Counter[str] = Counter()
+    skipped_reasons: Counter[str] = Counter()
     for row in rows:
         extensions.update(row.get("extensions", {}))
         ext_lines.update(row.get("extension_lines", {}))
+        skipped_ext_lines.update(row.get("excluded_extension_lines", {}))
+        skipped_reasons.update(row.get("excluded_reasons", {}))
     report["top_extensions_by_file_count"] = dict(extensions.most_common(30))
     if ext_lines:
         report["top_extensions_by_changed_lines"] = dict(ext_lines.most_common(30))
+    if skipped_ext_lines:
+        report["top_excluded_extensions_by_changed_lines"] = dict(skipped_ext_lines.most_common(30))
+        report["excluded_lines_by_reason"] = dict(skipped_reasons.most_common())
 
     # Always broken down per repository, because "which repositories drive which file types" is the
     # question the totals raise and cannot answer: a documentation repository and a service whose
@@ -686,9 +693,11 @@ def build_report(rows: list[dict[str, Any]], config: dict[str, Any]) -> dict[str
         label = name if named else f"repo-{index}"
         extensions: Counter[str] = Counter()
         ext_lines: Counter[str] = Counter()
+        skipped: Counter[str] = Counter()
         for item in items:
             extensions.update(item.get("extensions", {}))
             ext_lines.update(item.get("extension_lines", {}))
+            skipped.update(item.get("excluded_extension_lines", {}))
 
         with_lines = [i for i in items if i.get("changed_lines") is not None]
         entry: dict[str, Any] = {
@@ -697,6 +706,11 @@ def build_report(rows: list[dict[str, Any]], config: dict[str, Any]) -> dict[str
             "changed_lines_per_pr": summarise([i["changed_lines"] for i in with_lines]),
             "reviewable_lines_per_pr": summarise([i["reviewable_lines"] for i in with_lines]),
             "top_extensions_by_file_count": dict(extensions.most_common(15)),
+            "top_excluded_extensions_by_changed_lines": dict(skipped.most_common(15)),
+            "excluded_share_of_changed_lines_percent": (
+                round(100.0 * sum(skipped.values())
+                      / (sum(skipped.values()) + sum(ext_lines.values())), 1)
+                if (sum(skipped.values()) + sum(ext_lines.values())) else None),
         }
         if ext_lines:
             entry["top_extensions_by_changed_lines"] = dict(ext_lines.most_common(15))
@@ -793,9 +807,24 @@ def render(report: dict[str, Any]) -> str:
 
     exts = report.get("top_extensions_by_changed_lines") or report.get("top_extensions_by_file_count")
     if exts:
-        add("Most-changed file types")
+        add("Most-changed file types (reviewed)")
         for ext, count in list(exts.items())[:12]:
             add(f"  {ext:>12}  {count:>10,}")
+        add("")
+
+    skipped = report.get("top_excluded_extensions_by_changed_lines")
+    if skipped:
+        add("Most-changed file types (skipped)")
+        add("  Where the payload of a repository is its config, this is what we never look at.")
+        for ext, count in list(skipped.items())[:12]:
+            add(f"  {ext:>12}  {count:>10,}")
+        add("")
+
+    reasons = report.get("excluded_lines_by_reason")
+    if reasons:
+        add("Skipped changed lines, by reason")
+        for reason, count in reasons.items():
+            add(f"  {reason:>26}  {count:>12,}")
         add("")
 
     return "\n".join(out)
@@ -861,6 +890,8 @@ def build_row(repo: str, entry: dict[str, Any]) -> dict[str, Any]:
         "reviewable_lines": None,
         "largest_file_lines": None,
         "extension_lines": {},
+        "excluded_extension_lines": {},
+        "excluded_reasons": {},
         "reviewable_chars": None,
         "excluded_chars": None,
         "binary_files": None,
@@ -870,6 +901,8 @@ def build_row(repo: str, entry: dict[str, Any]) -> dict[str, Any]:
         return row
 
     ext_lines: Counter[str] = Counter()
+    excluded_ext_lines: Counter[str] = Counter()
+    excluded_reasons: Counter[str] = Counter()
     changed = reviewable = largest = reviewable_chars = excluded_chars = binaries = 0
 
     for added, deleted, chars, path, is_binary in files:
@@ -877,7 +910,8 @@ def build_row(repo: str, entry: dict[str, Any]) -> dict[str, Any]:
         changed += lines
         if is_binary:
             binaries += 1
-        if argus_exclusion_reason(path) is None:
+        reason = argus_exclusion_reason(path)
+        if reason is None:
             reviewable += lines
             reviewable_chars += chars
             largest = max(largest, lines)
@@ -886,11 +920,15 @@ def build_row(repo: str, entry: dict[str, Any]) -> dict[str, Any]:
             ext_lines[extension_of(path)] += lines
         else:
             excluded_chars += chars
+            excluded_ext_lines[extension_of(path)] += lines
+            excluded_reasons[reason] += lines
 
     row["changed_lines"] = changed
     row["reviewable_lines"] = reviewable
     row["largest_file_lines"] = largest
     row["extension_lines"] = dict(ext_lines)
+    row["excluded_extension_lines"] = dict(excluded_ext_lines)
+    row["excluded_reasons"] = dict(excluded_reasons)
     row["reviewable_chars"] = reviewable_chars
     row["excluded_chars"] = excluded_chars
     row["binary_files"] = binaries
