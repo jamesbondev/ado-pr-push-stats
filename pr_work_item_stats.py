@@ -724,6 +724,58 @@ def repository_rows(per_repo: dict[str, dict[str, Any]]) -> list[str]:
     return out
 
 
+def resolve_pr_ids(client: AdoClient, records: Sequence[PrRecord], quiet: bool) -> int:
+    """
+    Recover pull request ids for records cached before the id was recorded, without
+    re-scanning the organisation: list the repository's pull requests created in the minute
+    around the cached time and match on the exact set of linked work item ids. A few calls
+    per record. Returns how many were resolved.
+    """
+    repo_ids: dict[str, str | None] = {}
+    resolved = 0
+    for record in records:
+        if record.pr_id is not None:
+            continue
+        project, _, repo_name = record.repository.partition("/")
+        if record.repository not in repo_ids:
+            try:
+                repos = list_repositories(client, project)
+            except AdoError as exc:
+                if not quiet:
+                    print(f"  {project}: {exc}", file=sys.stderr)
+                repo_ids[record.repository] = None
+            else:
+                repo_ids[record.repository] = next(
+                    (r["id"] for r in repos if r["name"] == repo_name), None)
+        repo_id = repo_ids[record.repository]
+        if repo_id is None:
+            continue
+
+        window = timedelta(minutes=1)
+        try:
+            data = client.get(
+                f"{urllib.parse.quote(project)}/_apis/git/repositories/{repo_id}/pullrequests",
+                {
+                    "searchCriteria.status": "all",
+                    "searchCriteria.queryTimeRangeType": "created",
+                    "searchCriteria.minTime": (record.created_at - window).isoformat(),
+                    "searchCriteria.maxTime": (record.created_at + window).isoformat(),
+                    "$top": 50,
+                },
+            )
+            wanted = set(record.work_item_ids)
+            for candidate in data.get("value", []):
+                pr_id = int(candidate["pullRequestId"])
+                if set(pr_work_item_ids(client, project, repo_id, pr_id)) == wanted:
+                    record.pr_id = pr_id
+                    resolved += 1
+                    break
+        except AdoError as exc:
+            if not quiet:
+                print(f"  {record.repository}: {exc}", file=sys.stderr)
+    return resolved
+
+
 def render_over_cap(records: Sequence[PrRecord], work_items: dict[int, WorkItem],
                     policy: Policy) -> str:
     """
@@ -887,13 +939,37 @@ def main(argv: Sequence[str]) -> int:
         if args.cache:
             save_cache(args.cache, records, work_items, meta)
 
-    if args.drop_type:
-        dropped = set(args.drop_type)
+    dropped = set(args.drop_type)
+
+    def scored_ids(record: PrRecord) -> list[int]:
+        return [
+            wid for wid in record.work_item_ids
+            if wid not in work_items or work_items[wid].type not in dropped
+        ]
+
+    # Ids are matched and the cache rewritten on the full link sets, so this runs before
+    # --drop-type narrows them: a match against the live service needs every linked id, and
+    # a cache saved after the drop would have lost the dropped links for good.
+    if args.list_over_cap:
+        unresolved = [
+            r for r in records
+            if r.pr_id is None and len(scored_ids(r)) > policy.max_linked
+        ]
+        pat = os.environ.get("AZDO_PAT")
+        if unresolved and args.org and pat:
+            resolved = resolve_pr_ids(AdoClient(args.org, pat), unresolved, args.quiet)
+            if resolved and args.cache and os.path.exists(args.cache):
+                save_cache(args.cache, records, work_items, meta)
+            if not args.quiet:
+                print(f"  resolved {resolved} of {len(unresolved)} pull request ids",
+                      file=sys.stderr)
+        elif unresolved and not args.quiet:
+            print("  pass --org with AZDO_PAT set to look up the missing pull request ids",
+                  file=sys.stderr)
+
+    if dropped:
         for record in records:
-            record.work_item_ids = [
-                wid for wid in record.work_item_ids
-                if wid not in work_items or work_items[wid].type not in dropped
-            ]
+            record.work_item_ids = scored_ids(record)
 
     if args.list_over_cap:
         print(render_over_cap(records, work_items, policy))
