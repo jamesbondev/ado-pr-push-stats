@@ -325,6 +325,13 @@ The per-pull-request outcome rolls those up: `criteria`, `task only`, `criteria 
 read first, because it is the share of pull requests the description-as-criterion mode would
 exist to serve.
 
+A completed pull request can carry links that were added after it merged: a release pipeline
+that creates a work item per deployment and links it back is the usual case. Those links were
+never visible to a reviewer working on the open pull request, so a scan over completed pull
+requests overstates them. `--drop-type NAME` re-scores the cache as if that type had never been
+linked, which recovers the review-time picture: links per pull request, the cap, and the
+"only ignored types" and "nothing linked" outcomes all move.
+
 The `BY REPOSITORY` section and the `per_repository` block in the JSON carry the same outcomes
 per repository, plus how many of its pull requests link each work item type. A linking habit
 confined to two teams is a different finding from an estate-wide one: the first is a
@@ -349,6 +356,7 @@ share the `--json`.
 | `--ac-field TYPE=FIELD` | Repeatable. Criteria field for a type. |
 | `--default-ac-field NAME` | Criteria field for types not named above. |
 | `--max-linked N` | The cap to score. Default 5. |
+| `--drop-type NAME` | Repeatable. Score as if the type had never been linked. |
 | `--cache PATH` / `--refresh` | Keep raw records; force a re-fetch. |
 | `--concurrency N` | Parallel per-PR fetches. Default 8. |
 | `--anonymise-repos` | Replace repository names with `repo-1`...`repo-N`. |

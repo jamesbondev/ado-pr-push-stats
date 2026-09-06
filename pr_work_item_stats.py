@@ -644,6 +644,8 @@ def render(report: dict[str, Any]) -> str:
     for t, f in cfg["ac_field_by_type"].items():
         lines.append(f"  criteria field for {t}: {f}")
     lines.append(f"  criteria field otherwise: {cfg['default_ac_field']}")
+    if cfg.get("dropped_types"):
+        lines.append(f"  scored as if never linked: {', '.join(cfg['dropped_types'])}")
     lines.append("")
 
     lines.append("LINKS PER PULL REQUEST")
@@ -760,6 +762,10 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--default-ac-field", default=DEFAULT_AC_FIELD)
     parser.add_argument("--max-linked", type=int, default=MAX_LINKED_WORK_ITEMS,
                         help="The reviewer's linked-item cap to score. Default 5.")
+    parser.add_argument("--drop-type", action="append", default=[], metavar="NAME",
+                        help="Score as if this type had never been linked. Repeatable. For a "
+                             "type a pipeline links after merge, this recovers what the "
+                             "reviewer saw while the pull request was open.")
     parser.add_argument("--anonymise-repos", action="store_true",
                         help="Replace repository names with repo-1...repo-N in the output.")
     parser.add_argument("--json", metavar="PATH", help="Write the full report as JSON.")
@@ -844,9 +850,18 @@ def main(argv: Sequence[str]) -> int:
         if args.cache:
             save_cache(args.cache, records, work_items, meta)
 
+    if args.drop_type:
+        dropped = set(args.drop_type)
+        for record in records:
+            record.work_item_ids = [
+                wid for wid in record.work_item_ids
+                if wid not in work_items or work_items[wid].type not in dropped
+            ]
+
     config = {
         "days": meta.get("days", args.days),
         "statuses": meta.get("statuses", statuses),
+        "dropped_types": sorted(args.drop_type),
         "accepted_types": sorted(policy.accepted),
         "task_types": sorted(policy.tasks),
         "ac_field_by_type": policy.ac_field_by_type,
