@@ -525,6 +525,7 @@ def build_report(records: Sequence[PrRecord], work_items: dict[int, WorkItem],
     cap_prs_losing_assessable = 0
     cap_assessable_lost = 0
     per_repo: dict[str, Counter[str]] = defaultdict(Counter)
+    per_repo_types: dict[str, Counter[str]] = defaultdict(Counter)
 
     seen_items: set[int] = set()
 
@@ -542,6 +543,7 @@ def build_report(records: Sequence[PrRecord], work_items: dict[int, WorkItem],
 
         for present_type in {i.type for i in items if i is not None}:
             types_by_pr[present_type] += 1
+            per_repo_types[record.repository][present_type] += 1
 
         for item, fate in zip(items, item_fates):
             if item is None:
@@ -586,7 +588,11 @@ def build_report(records: Sequence[PrRecord], work_items: dict[int, WorkItem],
             "assessable_items_lost": cap_assessable_lost,
         },
         "per_repository": {
-            name: dict(counter) for name, counter in sorted(per_repo.items())
+            name: {
+                "outcomes": dict(counter),
+                "types": dict(per_repo_types[name]),  # PRs linking at least one of the type
+            }
+            for name, counter in sorted(per_repo.items())
         },
     }
 
@@ -673,7 +679,39 @@ def render(report: dict[str, Any]) -> str:
     lines.append(f"  assessable items lost in total:        {cap['assessable_items_lost']:,}")
     lines.append("")
 
+    lines.append("BY REPOSITORY (pull requests with at least one link; % of the repository's pull requests)")
+    lines.append("  Which repositories link Tasks or ignored types, so a habit confined to a few teams")
+    lines.append("  is not mistaken for an estate-wide one.")
+    lines.extend(repository_rows(report["per_repository"]))
+    lines.append("")
+
     return "\n".join(lines)
+
+
+def repository_rows(per_repo: dict[str, dict[str, Any]]) -> list[str]:
+    rows = []
+    for name, entry in per_repo.items():
+        outcomes = entry["outcomes"]
+        total = outcomes.get("pull_requests", 0)
+        linked = total - outcomes.get("nothing linked", 0)
+        if not linked:
+            continue
+        rows.append((linked, name, total, outcomes, entry["types"]))
+    if not rows:
+        return ["  (no repository links a work item)"]
+
+    rows.sort(key=lambda r: (-r[0], r[1]))
+    width = max(len(r[1]) for r in rows)
+    out = [f"  {'repository':<{width}}  {'linked':>6}  {'task only':>9}  {'ignored only':>12}  types linked"]
+    for linked, name, total, outcomes, types in rows:
+        task_only = outcomes.get("task only", 0)
+        ignored = outcomes.get("only ignored types", 0)
+        type_list = ", ".join(
+            f"{t} {n}" for t, n in sorted(types.items(), key=lambda kv: (-kv[1], kv[0])))
+        out.append(
+            f"  {name:<{width}}  {linked:6,}  {pct(task_only, total):8.1f}%  "
+            f"{pct(ignored, total):11.1f}%  {type_list}")
+    return out
 
 
 def table(entries: dict[str, dict[str, Any]]) -> list[str]:

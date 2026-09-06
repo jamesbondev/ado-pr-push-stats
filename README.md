@@ -325,6 +325,11 @@ The per-pull-request outcome rolls those up: `criteria`, `task only`, `criteria 
 read first, because it is the share of pull requests the description-as-criterion mode would
 exist to serve.
 
+The `BY REPOSITORY` section and the `per_repository` block in the JSON carry the same outcomes
+per repository, plus how many of its pull requests link each work item type. A linking habit
+confined to two teams is a different finding from an estate-wide one: the first is a
+conversation with those teams, the second is a rule in the reviewer.
+
 ## What leaves your network
 
 The report holds counts, work item type names, field reference names and repository names.
