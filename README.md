@@ -357,6 +357,7 @@ share the `--json`.
 | `--default-ac-field NAME` | Criteria field for types not named above. |
 | `--max-linked N` | The cap to score. Default 5. |
 | `--drop-type NAME` | Repeatable. Score as if the type had never been linked. |
+| `--list-over-cap` | Print the pull requests over the cap, with repository, id, date and linked types, instead of the report. Names pull requests, so it is never written to the JSON. |
 | `--cache PATH` / `--refresh` | Keep raw records; force a re-fetch. |
 | `--concurrency N` | Parallel per-PR fetches. Default 8. |
 | `--anonymise-repos` | Replace repository names with `repo-1`...`repo-N`. |

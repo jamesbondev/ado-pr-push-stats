@@ -195,6 +195,7 @@ class PrRecord:
     status: str
     created_at: datetime
     work_item_ids: list[int]  # in the order the service listed them
+    pr_id: int | None = None  # absent in caches written before it was recorded
 
 
 @dataclass
@@ -355,6 +356,7 @@ def collect(
                     status=str(pr.get("status", "")),
                     created_at=created,
                     work_item_ids=ids,
+                    pr_id=int(pr["pullRequestId"]),
                 )
 
             with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
@@ -397,6 +399,7 @@ def save_cache(path: str, records: Sequence[PrRecord], work_items: dict[int, Wor
                 "status": r.status,
                 "created_at": r.created_at.isoformat(),
                 "work_item_ids": r.work_item_ids,
+                "pr_id": r.pr_id,
             }
             for r in records
         ],
@@ -426,6 +429,7 @@ def load_cache(path: str) -> tuple[list[PrRecord], dict[int, WorkItem], dict[str
             status=item["status"],
             created_at=parse_time(item["created_at"]) or datetime.now(timezone.utc),
             work_item_ids=[int(i) for i in item["work_item_ids"]],
+            pr_id=item.get("pr_id"),
         )
         for item in payload["pull_requests"]
     ]
@@ -720,6 +724,35 @@ def repository_rows(per_repo: dict[str, dict[str, Any]]) -> list[str]:
     return out
 
 
+def render_over_cap(records: Sequence[PrRecord], work_items: dict[int, WorkItem],
+                    policy: Policy) -> str:
+    """
+    The pull requests behind the cap figures, for finding them in Azure DevOps. This is the
+    one output that names pull requests, so it is printed only on request and never written
+    to the report.
+    """
+    rows = []
+    for record in records:
+        if len(record.work_item_ids) <= policy.max_linked:
+            continue
+        types = Counter(
+            work_items[wid].type if wid in work_items else "(missing)"
+            for wid in record.work_item_ids)
+        rows.append((len(record.work_item_ids), record, types))
+    if not rows:
+        return "No pull request links more than the cap."
+
+    rows.sort(key=lambda r: (-r[0], r[1].repository))
+    lines = [f"PULL REQUESTS OVER THE CAP OF {policy.max_linked} ({len(rows)})"]
+    for count, record, types in rows:
+        ref = f"PR {record.pr_id}" if record.pr_id is not None else "PR id not cached"
+        summary = ", ".join(f"{t} {n}" for t, n in types.most_common())
+        lines.append(
+            f"  {record.repository}  {ref}  created {record.created_at:%Y-%m-%d}  "
+            f"{count} links: {summary}")
+    return "\n".join(lines)
+
+
 def table(entries: dict[str, dict[str, Any]]) -> list[str]:
     if not entries:
         return ["  (none)"]
@@ -766,6 +799,10 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
                         help="Score as if this type had never been linked. Repeatable. For a "
                              "type a pipeline links after merge, this recovers what the "
                              "reviewer saw while the pull request was open.")
+    parser.add_argument("--list-over-cap", action="store_true",
+                        help="Print the pull requests over the cap (repository, id, date, "
+                             "linked types) instead of the report. For your own eyes: it "
+                             "names pull requests.")
     parser.add_argument("--anonymise-repos", action="store_true",
                         help="Replace repository names with repo-1...repo-N in the output.")
     parser.add_argument("--json", metavar="PATH", help="Write the full report as JSON.")
@@ -857,6 +894,10 @@ def main(argv: Sequence[str]) -> int:
                 wid for wid in record.work_item_ids
                 if wid not in work_items or work_items[wid].type not in dropped
             ]
+
+    if args.list_over_cap:
+        print(render_over_cap(records, work_items, policy))
+        return 0
 
     config = {
         "days": meta.get("days", args.days),
