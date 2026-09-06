@@ -252,3 +252,99 @@ Diff characters are measured, at the same three lines of context the reviewer's 
 and divided by 2.2 — the constant in the reviewer's `TokenEstimator`. So the figure is an estimate
 of the same text by the same arithmetic, rather than a reconstruction from a per-line average. It
 is still not a tokeniser, and a file the reviewer excludes contributes nothing.
+
+---
+
+# pr_work_item_stats.py
+
+A third tool in the same repository, sharing the same `AZDO_PAT` and the same read-only
+posture. Where the other two measure pushes and diff sizes, this one measures *what pull
+requests link to*, so decisions about an AI reviewer's acceptance-criteria check — which work
+item types to assess, what to do with a Task, whether the linked-item cap is losing anything —
+are made against real pull requests.
+
+The PAT needs `Work Items (read)` as well as `Code (read)`: the pull request's linked ids come
+from the git API, the work items themselves from the work item tracking API.
+
+## What it answers
+
+- How many work items a pull request links, and how often it links none.
+- Which work item types appear at all, and which are the only thing linked.
+- Per type, which fields actually carry text — so the field a type keeps its criteria in is
+  read off the data rather than assumed, and a custom field nobody mentioned shows up.
+- How often a Task is linked on its own, with its parent, or under a parent of some other type.
+- How often the reviewer's cap of five, applied in service order before types are known, drops
+  an item that would have been assessed.
+
+## Running it
+
+```bash
+export AZDO_PAT=...                    # Code (read) + Work Items (read)
+python3 pr_work_item_stats.py \
+    --org https://dev.azure.com/contoso \
+    --all-projects \
+    --days 90 \
+    --cache work-items-raw.json \
+    --json pr-work-item-stats.json
+```
+
+Python 3.10+ and the standard library. Cost: one call per pull request, one batch call per two
+hundred distinct work items, and one more batch per two hundred parents not themselves linked.
+
+With `--cache`, the raw records are kept and every later question is re-scored from disk with
+no API calls. The rule set under test is entirely flags, so a different type list or field
+mapping is a re-run against the cache:
+
+```bash
+python3 pr_work_item_stats.py --cache work-items-raw.json --accepted-type "User Story" --accepted-type Bug
+python3 pr_work_item_stats.py --cache work-items-raw.json --ac-field "Incident Action=Custom.IncActionDescription"
+python3 pr_work_item_stats.py --cache work-items-raw.json --max-linked 10
+```
+
+## The rules it replays
+
+Defaults are the reviewer's proposed policy; every one is a flag.
+
+| Link | Fate |
+| --- | --- |
+| Accepted type (`Product Backlog Item`, `Bug`, `Incident Action`) with its criteria field populated | `criteria` — assessed |
+| Accepted type with the criteria field empty | `no_criteria` — reported as unassessed |
+| `Task` whose parent is linked to the same pull request and is an accepted type | `task_scope` — scope context, not criteria |
+| Any other `Task` with a description | `task_single` — the description as one criterion |
+| `Task` with neither | `task_empty` |
+| Any other type | `ignored` |
+| Deleted or unreadable | `missing` |
+
+The criteria field is `Microsoft.VSTS.Common.AcceptanceCriteria` unless `--ac-field TYPE=FIELD`
+says otherwise; `Incident Action` defaults to `Custom.IncActionDescription`. Emptiness is judged
+the way the reviewer judges it: tags stripped, entities decoded, whitespace ignored, so a field
+holding only `<p></p>` is empty.
+
+The per-pull-request outcome rolls those up: `criteria`, `task only`, `criteria + task`,
+`accepted but empty`, `only ignored types` or `nothing linked`. `task only` is the number to
+read first, because it is the share of pull requests the description-as-criterion mode would
+exist to serve.
+
+## What leaves your network
+
+The report holds counts, work item type names, field reference names and repository names.
+No work item ids, titles, descriptions or criteria text, and no pull request ids. Field
+*values* are inspected for emptiness inside the process and discarded. `--anonymise-repos`
+replaces the repository names. The `--cache` file does hold work item ids, so keep it local and
+share the `--json`.
+
+| Flag | Effect |
+| --- | --- |
+| `--all-projects` / `--project NAME` | Which projects to scan. |
+| `--days N` | How far back to look. Default 90. |
+| `--status active` | Repeatable. Default is `completed`. |
+| `--exclude-repo NAME` | Repeatable. |
+| `--accepted-type NAME` | Repeatable. Replaces the default list. |
+| `--task-type NAME` | Repeatable. Replaces the default list. |
+| `--ac-field TYPE=FIELD` | Repeatable. Criteria field for a type. |
+| `--default-ac-field NAME` | Criteria field for types not named above. |
+| `--max-linked N` | The cap to score. Default 5. |
+| `--cache PATH` / `--refresh` | Keep raw records; force a re-fetch. |
+| `--concurrency N` | Parallel per-PR fetches. Default 8. |
+| `--anonymise-repos` | Replace repository names with `repo-1`...`repo-N`. |
+| `--json PATH` | Write the full report as JSON. |
