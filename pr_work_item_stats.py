@@ -289,7 +289,11 @@ def fetch_work_items(client: AdoClient, ids: Iterable[int]) -> dict[int, WorkIte
             "_apis/wit/workitemsbatch",
             {"ids": chunk, "$expand": "relations", "errorPolicy": "omit"},
         )
+        # errorPolicy "omit" does not drop a deleted or inaccessible id: its slot in the
+        # array is null.
         for item in data.get("value", []):
+            if not isinstance(item, dict) or "id" not in item:
+                continue
             fields = item.get("fields") or {}
             parent = fields.get(PARENT_FIELD)
             parent_id = int(parent) if isinstance(parent, int) else parent_from_relations(item)
