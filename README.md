@@ -357,6 +357,7 @@ share the `--json`.
 | `--default-ac-field NAME` | Criteria field for types not named above. |
 | `--max-linked N` | The cap to score. Default 5. |
 | `--drop-type NAME` | Repeatable. Score as if the type had never been linked. |
+| `--branch-pairs` | Report source to target branch pairs per repository from the listings alone, flagging promotions between long-lived branches. Needs `--org`; no cache and no work item calls. Prints branch names. |
 | `--list-over-cap` | Print the pull requests over the cap, with repository, id, date and linked types, instead of the report. Names pull requests, so it is never written to the JSON. |
 | `--cache PATH` / `--refresh` | Keep raw records; force a re-fetch. |
 | `--concurrency N` | Parallel per-PR fetches. Default 8. |

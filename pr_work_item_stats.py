@@ -776,6 +776,73 @@ def resolve_pr_ids(client: AdoClient, records: Sequence[PrRecord], quiet: bool) 
     return resolved
 
 
+def short_ref(ref: str | None) -> str:
+    return (ref or "?").removeprefix("refs/heads/")
+
+
+def branch_pairs_report(
+    client: AdoClient, projects: Sequence[str], excluded: set[str], since: datetime,
+    statuses: Sequence[str], page_size: int, quiet: bool,
+) -> str:
+    """
+    Where pull requests go, per repository, from the listings alone. A source branch that is
+    also a target branch in the same repository is a promotion between long-lived branches,
+    which is the shape a release merge takes. Branch names are printed; nothing else is.
+    """
+    lines: list[str] = []
+    estate_targets: Counter[str] = Counter()
+    promotions: list[tuple[int, str, str, str, int]] = []
+    total = 0
+
+    for project in projects:
+        try:
+            repos = list_repositories(client, project)
+        except AdoError as exc:
+            if not quiet:
+                print(f"  {project}: {exc}", file=sys.stderr)
+            continue
+        for repo in repos:
+            if repo["name"].lower() in excluded:
+                continue
+            try:
+                prs = list_pull_requests(client, project, repo["id"], since, statuses, page_size)
+            except AdoError as exc:
+                if not quiet:
+                    print(f"  {project}/{repo['name']}: {exc}", file=sys.stderr)
+                continue
+            if not prs:
+                continue
+            total += len(prs)
+            pairs = Counter(
+                (short_ref(pr.get("sourceRefName")), short_ref(pr.get("targetRefName")))
+                for pr in prs)
+            targets = Counter()
+            for (_, target), n in pairs.items():
+                targets[target] += n
+            estate_targets.update(targets)
+            # A branch targeted once is a stacked feature branch, not an integration branch.
+            for (source, target), n in pairs.items():
+                if targets.get(source, 0) >= 2:
+                    promotions.append(
+                        (n, f"{project}/{repo['name']}", source, target, targets[source]))
+
+    lines.append(f"BRANCH PAIRS ({total:,} pull requests)")
+    lines.append("")
+    lines.append("TARGET BRANCHES ACROSS THE ESTATE")
+    for target, n in estate_targets.most_common(15):
+        lines.append(f"  {target:<40} {n:6,}  {pct(n, total):5.1f}%")
+    lines.append("")
+    lines.append("PROMOTIONS: source branch is itself a target of two or more pull requests in the repository")
+    if not promotions:
+        lines.append("  (none)")
+    promotions.sort(key=lambda p: (-p[0], p[1]))
+    for n, repo, source, target, into_source in promotions:
+        lines.append(
+            f"  {repo}  {source} -> {target}  {n} pull requests; "
+            f"{into_source} pull requests went into {source}")
+    return "\n".join(lines)
+
+
 def render_over_cap(records: Sequence[PrRecord], work_items: dict[int, WorkItem],
                     policy: Policy) -> str:
     """
@@ -851,6 +918,10 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
                         help="Score as if this type had never been linked. Repeatable. For a "
                              "type a pipeline links after merge, this recovers what the "
                              "reviewer saw while the pull request was open.")
+    parser.add_argument("--branch-pairs", action="store_true",
+                        help="Report source -> target branch pairs per repository from the "
+                             "pull request listings alone, and flag promotions between "
+                             "long-lived branches. Needs --org; no cache, no work item calls.")
     parser.add_argument("--list-over-cap", action="store_true",
                         help="Print the pull requests over the cap (repository, id, date, "
                              "linked types) instead of the report. For your own eyes: it "
@@ -898,6 +969,25 @@ def main(argv: Sequence[str]) -> int:
     records: list[PrRecord]
     work_items: dict[int, WorkItem]
     meta: dict[str, Any]
+
+    if args.branch_pairs:
+        pat = os.environ.get("AZDO_PAT")
+        if not pat or not args.org:
+            print("--branch-pairs needs --org and AZDO_PAT.", file=sys.stderr)
+            return 2
+        client = AdoClient(args.org, pat)
+        try:
+            projects = list_projects(client) if args.all_projects else args.project
+            if not projects:
+                print("Give --project NAME or --all-projects.", file=sys.stderr)
+                return 2
+            print(branch_pairs_report(
+                client, projects, {n.lower() for n in args.exclude_repo}, since, statuses,
+                args.page_size, args.quiet))
+        except AdoError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        return 0
 
     if args.cache and os.path.exists(args.cache) and not args.refresh:
         try:
